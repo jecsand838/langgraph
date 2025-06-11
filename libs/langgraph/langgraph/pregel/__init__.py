@@ -8,7 +8,7 @@ import weakref
 from collections import defaultdict, deque
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from functools import partial
-from typing import Any, Callable, Union, cast, get_type_hints
+from typing import Any, Callable, Generic, Union, cast, get_type_hints
 from uuid import UUID, uuid5
 
 from langchain_core.globals import get_debug
@@ -107,6 +107,7 @@ from langgraph.types import (
     StreamChunk,
     StreamMode,
 )
+from langgraph.typing import InputT, OutputT, StateT
 from langgraph.utils.config import (
     ensure_config,
     merge_configs,
@@ -140,40 +141,38 @@ class NodeBuilder:
         "_metadata",
         "_writes",
         "_bound",
-        "_retries",
-        "_cache",
+        "_retry_policy",
+        "_cache_policy",
     )
 
-    _channels: list[str] | dict[str, str]
+    _channels: str | list[str]
     _triggers: list[str]
     _tags: list[str]
     _metadata: dict[str, Any]
     _writes: list[ChannelWriteEntry]
     _bound: Runnable
-    _retries: list[RetryPolicy]
-    _cache: CachePolicy | None
+    _retry_policy: list[RetryPolicy]
+    _cache_policy: CachePolicy | None
 
     def __init__(
         self,
     ) -> None:
-        self._channels = {}
+        self._channels = []
         self._triggers = []
         self._tags = []
         self._metadata = {}
         self._writes = []
         self._bound = DEFAULT_BOUND
-        self._retries = []
-        self._cache = None
+        self._retry_policy = []
+        self._cache_policy = None
 
     def subscribe_only(
         self,
         channel: str,
     ) -> Self:
         """Subscribe to a single channel."""
-        if isinstance(self._channels, list):
-            self._channels.append(channel)
-        elif not self._channels:
-            self._channels = [channel]
+        if not self._channels:
+            self._channels = channel
         else:
             raise ValueError(
                 "Cannot subscribe to single channels when other channels are already subscribed to"
@@ -199,15 +198,15 @@ class NodeBuilder:
         Returns:
             Self for chaining
         """
-        if isinstance(self._channels, list):
+        if isinstance(self._channels, str):
             raise ValueError(
                 "Cannot subscribe to channels when subscribed to a single channel"
             )
         if read:
             if not self._channels:
-                self._channels = {chan: chan for chan in channels}
+                self._channels = list(channels)
             else:
-                self._channels.update({chan: chan for chan in channels})
+                self._channels.extend(channels)
 
         if isinstance(channels, str):
             self._triggers.append(channels)
@@ -221,11 +220,10 @@ class NodeBuilder:
         *channels: str,
     ) -> Self:
         """Adds the specified channels to read from, without subscribing to them."""
-        assert self._channels, "Channels must be specified first"
-        assert isinstance(self._channels, dict), (
+        assert isinstance(self._channels, list), (
             "Cannot read additional channels when subscribed to single channels"
         )
-        self._channels.update({c: c for c in channels})
+        self._channels.extend(channels)
         return self
 
     def do(
@@ -273,14 +271,14 @@ class NodeBuilder:
         self._metadata.update(metadata)
         return self
 
-    def retry(self, *policies: RetryPolicy) -> Self:
+    def add_retry_policies(self, *policies: RetryPolicy) -> Self:
         """Adds retry policies to the node."""
-        self._retries.extend(policies)
+        self._retry_policy.extend(policies)
         return self
 
-    def cache(self, policy: CachePolicy) -> Self:
+    def add_cache_policy(self, policy: CachePolicy) -> Self:
         """Adds cache policies to the node."""
-        self._cache = policy
+        self._cache_policy = policy
         return self
 
     def build(self) -> PregelNode:
@@ -292,12 +290,12 @@ class NodeBuilder:
             metadata=self._metadata,
             writers=[ChannelWrite(self._writes)],
             bound=self._bound,
-            retry_policy=self._retries,
-            cache_policy=self._cache,
+            retry_policy=self._retry_policy,
+            cache_policy=self._cache_policy,
         )
 
 
-class Pregel(PregelProtocol):
+class Pregel(PregelProtocol[StateT, InputT, OutputT], Generic[StateT, InputT, OutputT]):
     """Pregel manages the runtime behavior for LangGraph applications.
 
     ## Overview
@@ -738,7 +736,8 @@ class Pregel(PregelProtocol):
         }
 
     def copy(self, update: dict[str, Any] | None = None) -> Self:
-        attrs = {**self.__dict__, **(update or {})}
+        attrs = {k: v for k, v in self.__dict__.items() if k != "__orig_class__"}
+        attrs.update(update or {})
         return self.__class__(**attrs)
 
     def with_config(self, config: RunnableConfig | None = None, **kwargs: Any) -> Self:
@@ -2279,7 +2278,7 @@ class Pregel(PregelProtocol):
 
     def stream(
         self,
-        input: dict[str, Any] | Any,
+        input: InputT,
         config: RunnableConfig | None = None,
         *,
         stream_mode: StreamMode | list[StreamMode] | None = None,
@@ -2314,7 +2313,7 @@ class Pregel(PregelProtocol):
             output_keys: The keys to stream, defaults to all non-context channels.
             interrupt_before: Nodes to interrupt before, defaults to all nodes in the graph.
             interrupt_after: Nodes to interrupt after, defaults to all nodes in the graph.
-            checkpoint_during: Whether to checkpoint intermediate steps, defaults to True. If False, only the final checkpoint is saved.
+            checkpoint_during: Whether to checkpoint intermediate steps, defaults to False. If False, only the final checkpoint is saved.
             debug: Whether to print debug information during execution, defaults to False.
             subgraphs: Whether to stream events from inside subgraphs, defaults to False.
                 If True, the events will be emitted as tuples `(namespace, data)`,
@@ -2421,7 +2420,7 @@ class Pregel(PregelProtocol):
                 debug=debug,
                 checkpoint_during=checkpoint_during
                 if checkpoint_during is not None
-                else config[CONF].get(CONFIG_KEY_CHECKPOINT_DURING, True),
+                else config[CONF].get(CONFIG_KEY_CHECKPOINT_DURING, False),
                 trigger_to_nodes=self.trigger_to_nodes,
                 migrate_checkpoint=self._migrate_checkpoint,
                 retry_policy=self.retry_policy,
@@ -2500,7 +2499,7 @@ class Pregel(PregelProtocol):
 
     async def astream(
         self,
-        input: dict[str, Any] | Any,
+        input: InputT,
         config: RunnableConfig | None = None,
         *,
         stream_mode: StreamMode | list[StreamMode] | None = None,
@@ -2535,7 +2534,7 @@ class Pregel(PregelProtocol):
             output_keys: The keys to stream, defaults to all non-context channels.
             interrupt_before: Nodes to interrupt before, defaults to all nodes in the graph.
             interrupt_after: Nodes to interrupt after, defaults to all nodes in the graph.
-            checkpoint_during: Whether to checkpoint intermediate steps, defaults to True. If False, only the final checkpoint is saved.
+            checkpoint_during: Whether to checkpoint intermediate steps, defaults to False. If False, only the final checkpoint is saved.
             debug: Whether to print debug information during execution, defaults to False.
             subgraphs: Whether to stream events from inside subgraphs, defaults to False.
                 If True, the events will be emitted as tuples `(namespace, data)`,
@@ -2664,7 +2663,7 @@ class Pregel(PregelProtocol):
                 debug=debug,
                 checkpoint_during=checkpoint_during
                 if checkpoint_during is not None
-                else config[CONF].get(CONFIG_KEY_CHECKPOINT_DURING, True),
+                else config[CONF].get(CONFIG_KEY_CHECKPOINT_DURING, False),
                 trigger_to_nodes=self.trigger_to_nodes,
                 migrate_checkpoint=self._migrate_checkpoint,
                 retry_policy=self.retry_policy,
@@ -2736,14 +2735,13 @@ class Pregel(PregelProtocol):
 
     def invoke(
         self,
-        input: dict[str, Any] | Any,
+        input: InputT,
         config: RunnableConfig | None = None,
         *,
         stream_mode: StreamMode = "values",
         output_keys: str | Sequence[str] | None = None,
         interrupt_before: All | Sequence[str] | None = None,
         interrupt_after: All | Sequence[str] | None = None,
-        checkpoint_during: bool | None = None,
         debug: bool | None = None,
         **kwargs: Any,
     ) -> dict[str, Any] | Any:
@@ -2765,8 +2763,8 @@ class Pregel(PregelProtocol):
         """
         output_keys = output_keys if output_keys is not None else self.output_channels
 
-        latest: Union[dict[str, Any], Any] = None
-        chunks: list[Union[dict[str, Any], Any]] = []
+        latest: dict[str, Any] | Any = None
+        chunks: list[dict[str, Any] | Any] = []
         interrupts: list[Interrupt] = []
 
         for chunk in self.stream(
@@ -2776,7 +2774,6 @@ class Pregel(PregelProtocol):
             output_keys=output_keys,
             interrupt_before=interrupt_before,
             interrupt_after=interrupt_after,
-            checkpoint_during=checkpoint_during,
             debug=debug,
             **kwargs,
         ):
@@ -2804,14 +2801,13 @@ class Pregel(PregelProtocol):
 
     async def ainvoke(
         self,
-        input: dict[str, Any] | Any,
+        input: InputT,
         config: RunnableConfig | None = None,
         *,
         stream_mode: StreamMode = "values",
         output_keys: str | Sequence[str] | None = None,
         interrupt_before: All | Sequence[str] | None = None,
         interrupt_after: All | Sequence[str] | None = None,
-        checkpoint_during: bool | None = None,
         debug: bool | None = None,
         **kwargs: Any,
     ) -> dict[str, Any] | Any:
@@ -2834,8 +2830,8 @@ class Pregel(PregelProtocol):
 
         output_keys = output_keys if output_keys is not None else self.output_channels
 
-        latest: Union[dict[str, Any], Any] = None
-        chunks: list[Union[dict[str, Any], Any]] = []
+        latest: dict[str, Any] | Any = None
+        chunks: list[dict[str, Any] | Any] = []
         interrupts: list[Interrupt] = []
 
         async for chunk in self.astream(
@@ -2845,7 +2841,6 @@ class Pregel(PregelProtocol):
             output_keys=output_keys,
             interrupt_before=interrupt_before,
             interrupt_after=interrupt_after,
-            checkpoint_during=checkpoint_during,
             debug=debug,
             **kwargs,
         ):

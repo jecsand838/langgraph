@@ -13,7 +13,7 @@ license = "MIT"
 license-files = ['LICENSE']
 dependencies = [
     "langchain-core>=0.2.38",
-    "ormsgpack>=1.8.0",
+    "ormsgpack>=1.10.0",
 ]
 
 [project.urls]
@@ -29,6 +29,7 @@ dev = [
   "pytest-watcher",
   "mypy",
   "dataclasses-json",
+  "numpy",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -46,7 +47,7 @@ lint.select = [
   "B",  # flake8-bugbear
   "I",  # isort
 ]
-lint.ignore = ["E501", "B008", "UP007", "UP006"]
+lint.ignore = ["E501", "B008"]
 
 [tool.pytest-watcher]
 now = true
