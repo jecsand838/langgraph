@@ -1,4 +1,4 @@
-# langgraph/checkpoint/memgraph/base.py
+# libs/checkpoint-memgraph/langgraph/checkpoint/memgraph/base.py
 """
 Shared helper routines, Cypher schema migrations, and blob (de)serialization
 utilities for both synchronous and asynchronous Memgraph savers.
@@ -7,8 +7,7 @@ utilities for both synchronous and asynchronous Memgraph savers.
 from __future__ import annotations
 
 import random
-from datetime import datetime, timezone
-from typing import Any, Mapping, Sequence, Tuple, cast, overload
+from typing import Any, Mapping, Sequence, Tuple, cast
 
 from langgraph.checkpoint.base import (
     WRITES_IDX_MAP,
@@ -17,40 +16,40 @@ from langgraph.checkpoint.base import (
     get_checkpoint_id,
 )
 from langgraph.checkpoint.serde.base import SerializerProtocol
-from langgraph.checkpoint.serde.types import TASKS
+
+# --------------------------------------------------------------------------- #
+# NOTE:  The constraint syntax below follows the variant accepted by
+# Memgraph ≥ 2.10 (based on the openCypher draft).  Neo4j will also accept
+# this form, so a single migration set keeps both back‑ends happy.
+# --------------------------------------------------------------------------- #
+MIGRATIONS: Sequence[str] = (
+    # 0 ─ baseline marker (no‑op)
+    "MERGE (:Migration {v: 0})",
+    # 1 ─ composite uniqueness for checkpoints
+    """
+    CREATE CONSTRAINT ON (c:Checkpoint)
+    ASSERT (c.thread_id, c.checkpoint_ns, c.checkpoint_id) IS UNIQUE
+    """,
+    # 2 ─ composite uniqueness for blobs
+    """
+    CREATE CONSTRAINT ON (b:Blob)
+    ASSERT (b.thread_id, b.checkpoint_ns, b.channel, b.version) IS UNIQUE
+    """,
+    # 3 ─ composite uniqueness for pending writes
+    """
+    CREATE CONSTRAINT ON (w:Write)
+    ASSERT (
+        w.thread_id, w.checkpoint_ns, w.checkpoint_id,
+        w.task_id, w.idx
+    ) IS UNIQUE
+    """,
+)
 
 
 class BaseMemgraphSaver(BaseCheckpointSaver[str]):
     """Logic shared by sync & async Memgraph saver implementations."""
 
-    # --------------------------------------------------------------------- #
-    # Migrations (executed via Cypher in `setup()`)
-    # --------------------------------------------------------------------- #
-    MIGRATIONS: Sequence[str] = (
-        # Track applied versions
-        """
-        MERGE (:Migration {v: 0});
-        """,
-        # Checkpoint nodes and uniqueness
-        """
-        CREATE CONSTRAINT checkpoint_pk IF NOT EXISTS
-        FOR (c:Checkpoint)
-        REQUIRE (c.thread_id, c.checkpoint_ns, c.checkpoint_id) IS UNIQUE;
-        """,
-        # Blob nodes
-        """
-        CREATE CONSTRAINT blob_pk IF NOT EXISTS
-        FOR (b:Blob)
-        REQUIRE (b.thread_id, b.checkpoint_ns, b.channel, b.version) IS UNIQUE;
-        """,
-        # Write nodes
-        """
-        CREATE CONSTRAINT write_pk IF NOT EXISTS
-        FOR (w:Write)
-        REQUIRE (w.thread_id, w.checkpoint_ns, w.checkpoint_id,
-                 w.task_id, w.idx) IS UNIQUE;
-        """,
-    )
+    MIGRATIONS: Sequence[str] = MIGRATIONS
 
     # ------------------------------------------------------------------ #
     def __init__(self, *, serde: SerializerProtocol | None = None) -> None:

@@ -1,6 +1,10 @@
+# libs/checkpoint-memgraph/langgraph/checkpoint/memgraph/saver.py
+"""Synchronous Memgraph checkpoint saver (production‑ready)."""
+
 from __future__ import annotations
 
 import threading
+from contextlib import contextmanager
 from typing import Any, Iterator, Sequence
 
 from neo4j import Driver, GraphDatabase, Transaction
@@ -12,9 +16,10 @@ from langgraph.checkpoint.base import (
     Checkpoint,
     CheckpointMetadata,
     CheckpointTuple,
+    get_checkpoint_metadata,
 )
 from langgraph.checkpoint.memgraph import _internal
-from langgraph.checkpoint.memgraph._utils import parse_bolt_uri
+from langgraph.store.memgraph._utils import parse_bolt_uri  # reuse common helper
 from langgraph.checkpoint.memgraph.base import BaseMemgraphSaver
 
 
@@ -36,34 +41,25 @@ class MemgraphSaver(BaseMemgraphSaver):
         self.conn = conn
         self.lock = threading.Lock()
 
-    # ---------- builder ------------------------------------------------ #
     @classmethod
     def from_conn_string(cls, conn: str, **driver_kwargs: Any) -> "MemgraphSaver":
-        """
-        Build a :class:`MemgraphSaver` from a *single* Bolt/Neo4j connection URI
-        (optionally containing inline ``user:pass`` credentials).
-
-        Example accepted URIs::
-
-            bolt://localhost:7687
-            bolt://neo4j:secret@db.example.com:7687
-            neo4j://scott:tiger@10.0.0.5
-        """
-        parsed = parse_bolt_uri(conn)
+        """Instantiate directly from a Bolt/Neo4j URI (user/pass supported)."""
+        p = parse_bolt_uri(conn)
         driver: Driver = GraphDatabase.driver(  # type: ignore[arg-type]
-            parsed["bolt_uri"], auth=(parsed["user"], parsed["password"]), **driver_kwargs
+            p["bolt_uri"], auth=(p["user"], p["password"]), **driver_kwargs
         )
         return cls(driver)
 
-    # ---------- context management ------------------------------------- #
-    def __enter__(self) -> "MemgraphSaver":  # pragma: no cover
+    # Context‑manager hooks (allow ``with MemgraphSaver.from_conn_string()``)
+    # ------------------------------------------------------------------ #
+    def __enter__(self) -> "MemgraphSaver":
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> None:  # pragma: no cover
+    def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
 
     def close(self) -> None:
-        """Close the underlying connection (if we own it)."""
+        """Cleanly close the underlying Driver, if we created one."""
         if isinstance(self.conn, Driver):
             self.conn.close()
 
@@ -74,7 +70,7 @@ class MemgraphSaver(BaseMemgraphSaver):
         """Run Cypher migrations (idempotent)."""
         with _internal.get_connection(self.conn) as sess:
             with sess.begin_transaction() as tx:  # type: ignore[attr-defined]
-                tx.run("MERGE (:Migration {v: -1})")  # ensure table exists
+                tx.run("MERGE (:Migration {v: -1})")
                 latest = tx.run(
                     "MATCH (m:Migration) RETURN max(m.v) AS v"
                 ).single()["v"]
@@ -87,8 +83,6 @@ class MemgraphSaver(BaseMemgraphSaver):
     # Internal cursor helper
     # ------------------------------------------------------------------ #
     def _cursor(self) -> Iterator[Transaction]:
-        from contextlib import contextmanager
-
         @contextmanager
         def _ctx():
             with self.lock, _internal.get_connection(self.conn) as sess:
@@ -152,7 +146,9 @@ class MemgraphSaver(BaseMemgraphSaver):
                         channel:$chan, version:$ver
                     })
                     ON CREATE SET b.type=$type_tag, b.blob=$blob
-                    MERGE (c:Checkpoint {thread_id:$tid, checkpoint_ns:$ns, checkpoint_id:$cid})
+                    MERGE (c:Checkpoint {
+                        thread_id:$tid, checkpoint_ns:$ns, checkpoint_id:$cid
+                    })
                     MERGE (c)-[:HAS_BLOB]->(b)
                     """,
                     tid=tid,
@@ -166,7 +162,7 @@ class MemgraphSaver(BaseMemgraphSaver):
         return next_config
 
     # ------------------------------------------------------------------ #
-    # --------- writes support ----------------------------------------- #
+    # Writes (intermediate channel output)                                #
     # ------------------------------------------------------------------ #
     def put_writes(
         self,
@@ -183,14 +179,7 @@ class MemgraphSaver(BaseMemgraphSaver):
         ns = config["configurable"].get("checkpoint_ns", "")
         cid = config["configurable"]["checkpoint_id"]
 
-        rows = self._dump_writes(
-            tid,
-            ns,
-            cid,
-            task_id,
-            task_path,
-            writes,
-        )
+        rows = self._dump_writes(tid, ns, cid, task_id, task_path, writes)
 
         with self._cursor() as tx:
             for (
@@ -207,21 +196,16 @@ class MemgraphSaver(BaseMemgraphSaver):
                 tx.run(
                     """
                     MERGE (w:Write {
-                        thread_id:$tid,
-                        checkpoint_ns:$ns,
-                        checkpoint_id:$cid,
-                        task_id:$task_id,
-                        idx:$idx
+                        thread_id:$tid, checkpoint_ns:$ns, checkpoint_id:$cid,
+                        task_id:$task_id, idx:$idx
                     })
-                    SET w.task_path=$t_path,
+                    SET w.task_path=$task_path,
                         w.channel=$channel,
                         w.type=$type_tag,
                         w.blob=$blob
                     WITH w
                     MATCH (c:Checkpoint {
-                        thread_id:$tid,
-                        checkpoint_ns:$ns,
-                        checkpoint_id:$cid
+                        thread_id:$tid, checkpoint_ns:$ns, checkpoint_id:$cid
                     })
                     MERGE (c)-[:HAS_WRITE]->(w)
                     """,
@@ -229,15 +213,15 @@ class MemgraphSaver(BaseMemgraphSaver):
                     ns=ns,
                     cid=cid,
                     task_id=t_id,
-                    t_path=t_path,
                     idx=idx,
+                    task_path=t_path,
                     channel=channel,
                     type_tag=type_tag,
                     blob=blob,
                 )
 
     # ------------------------------------------------------------------ #
-    # --------- checkpoint retrieval utilities ------------------------- #
+    # Retrieval helpers                                                  #
     # ------------------------------------------------------------------ #
     def _build_checkpoint_tuple(
         self,
@@ -245,10 +229,8 @@ class MemgraphSaver(BaseMemgraphSaver):
         blobs: list[tuple[str, str, bytes]],
         writes: list[tuple[str, str, str, bytes]],
     ) -> CheckpointTuple:
-        """Helper to construct CheckpointTuple from raw record pieces."""
         checkpoint_dict = chk_node["checkpoint"]
         checkpoint_dict["channel_values"] = self._load_blobs(blobs)
-
         pending_writes = self._load_writes(writes)
 
         return CheckpointTuple(
@@ -277,7 +259,6 @@ class MemgraphSaver(BaseMemgraphSaver):
 
     # ------------------------------------------------------------------ #
     def get_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
-        """Retrieve a single checkpoint tuple."""
         where, params = self._search_where(config, None, None)
         cypher = f"""
         MATCH (c:Checkpoint) {where}
@@ -293,14 +274,8 @@ class MemgraphSaver(BaseMemgraphSaver):
             rec = sess.run(cypher, **params).single()
             if not rec:
                 return None
-            chk_node = rec["chk"]
-            blobs = rec["blobs"]
-            writes = rec["writes"]
+            return self._build_checkpoint_tuple(rec["chk"], rec["blobs"], rec["writes"])
 
-        return self._build_checkpoint_tuple(chk_node, blobs, writes)
-
-    # ------------------------------------------------------------------ #
-    # --------- list ----------------------------------------------------#
     # ------------------------------------------------------------------ #
     def list(
         self,
@@ -310,9 +285,6 @@ class MemgraphSaver(BaseMemgraphSaver):
         before: RunnableConfig | None = None,
         limit: int | None = None,
     ) -> Iterator[CheckpointTuple]:
-        """
-        Yield checkpoints matching the given criteria ordered by newest first.
-        """
         where, params = self._search_where(config, filter, before)
         cypher = f"""
         MATCH (c:Checkpoint) {where}
@@ -328,25 +300,17 @@ class MemgraphSaver(BaseMemgraphSaver):
             params["limit"] = limit
 
         with _internal.get_connection(self.conn) as sess:
-            result = sess.run(cypher, **params)
-            for rec in result:
-                yield self._build_checkpoint_tuple(
-                    rec["chk"],
-                    rec["blobs"],
-                    rec["writes"],
-                )
+            for rec in sess.run(cypher, **params):
+                yield self._build_checkpoint_tuple(rec["chk"], rec["blobs"], rec["writes"])
 
     # ------------------------------------------------------------------ #
-    # --------- delete helpers ----------------------------------------- #
-    # ------------------------------------------------------------------ #
     def delete_thread(self, thread_id: str) -> None:
-        """Remove all checkpoints / blobs / writes for a given thread."""
+        """Remove all checkpoints, blobs and writes for the given thread."""
         with self._cursor() as tx:
             tx.run(
                 """
                 MATCH (n)
-                WHERE (n:Checkpoint OR n:Blob OR n:Write)
-                  AND n.thread_id = $tid
+                WHERE (n:Checkpoint OR n:Blob OR n:Write) AND n.thread_id = $tid
                 DETACH DELETE n
                 """,
                 tid=str(thread_id),
