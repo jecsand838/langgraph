@@ -1,4 +1,3 @@
-# libs/checkpoint-memgraph/langgraph/store/memgraph/aio.py
 from __future__ import annotations
 
 import asyncio
@@ -88,12 +87,31 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):
 
     # ------------------------------------------------------------------ #
     async def setup(self) -> None:
+        """Set up the store."""
         if self._setup_done:
             return
-        async with self._driver.session() as sess:
-            await sess.execute_write(
-                lambda tx: self._create_schema(tx, self._vector_cfg)  # type: ignore[arg-type]
+
+        async def _setup_tx(tx):
+            # Create base indexes/constraints
+            await tx.run(
+                f"""
+                CREATE CONSTRAINT entry_unique IF NOT EXISTS
+                ON (n:{self.NODE_LABEL})
+                ASSERT (n.namespace, n.key) IS UNIQUE
+                """
             )
+            await tx.run(
+                f"""
+                CREATE INDEX entry_expire IF NOT EXISTS
+                FOR (n:{self.NODE_LABEL}) ON (n.expire_at)
+                """
+            )
+            # Create vector index if configured
+            if self._vector_cfg:
+                await tx.run(self._vector_index_cypher(self._vector_cfg))
+
+        async with self._driver.session() as sess:
+            await sess.execute_write(_setup_tx)
         self._setup_done = True
         if self._ttl_cfg and self._ttl_cfg.sweep_interval_minutes:
             self._start_ttl_sweeper()
@@ -446,3 +464,31 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):
                     )
                 )
         return items
+
+    # Add these methods to the AsyncMemgraphStore class
+
+    # ------------------------------------------------------------------ #
+    async def abatch(self, ops: Iterable[Any]) -> list[Any]:
+        """Async batch operation implementation."""
+        results = []
+        for op in ops:
+            # This is a basic implementation - you may want to optimize for bulk operations
+            if hasattr(op, 'operation') and hasattr(op, 'namespace') and hasattr(op, 'key'):
+                if op.operation == 'get':
+                    result = await self.aget(op.namespace, op.key)
+                elif op.operation == 'put':
+                    result = await self.aput(op.namespace, op.key, op.value)
+                elif op.operation == 'delete':
+                    await self.adelete(op.namespace, op.key)
+                    result = None
+                else:
+                    raise ValueError(f"Unknown operation: {op.operation}")
+                results.append(result)
+            else:
+                raise ValueError(f"Invalid operation format: {op}")
+        return results
+
+    def batch(self, ops: Iterable[Any]) -> list[Any]:
+        """Sync batch operation implementation (delegates to async)."""
+        import asyncio
+        return asyncio.run(self.abatch(ops))

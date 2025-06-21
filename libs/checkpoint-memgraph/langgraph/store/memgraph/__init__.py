@@ -137,6 +137,35 @@ class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):
     def __enter__(self) -> "MemgraphStore":
         return self
 
+    def batch(self, ops: Iterable[Any]) -> list[Any]:
+        """Synchronous batch operation implementation."""
+        results = []
+        for op in ops:
+            # Basic implementation - you may want to optimize this for true bulk operations
+            if hasattr(op, 'operation') and hasattr(op, 'namespace') and hasattr(op, 'key'):
+                if op.operation == 'get':
+                    result = self.get(op.namespace, op.key)
+                elif op.operation == 'put':
+                    result = self.put(op.namespace, op.key, op.value)
+                elif op.operation == 'delete':
+                    self.delete(op.namespace, op.key)
+                    result = None
+                else:
+                    raise ValueError(f"Unknown operation: {op.operation}")
+                results.append(result)
+            else:
+                raise ValueError(f"Invalid operation format: {op}")
+        return results
+
+    def abatch(self, ops: Iterable[Any]) -> list[Any]:
+        """Async batch operation implementation (sync wrapper)."""
+        import asyncio
+        return asyncio.run(self._abatch_impl(ops))
+    
+    async def _abatch_impl(self, ops: Iterable[Any]) -> list[Any]:
+        """Helper for async batch implementation."""
+        return self.batch(ops)  # Delegate to sync version
+
     def __exit__(
         self,
         exc_type: Optional[Type[BaseException]],
