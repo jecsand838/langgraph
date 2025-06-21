@@ -2,13 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import inspect
 import json
 import logging
-from dataclasses import fields, is_dataclass  # only imported for mix‑in helper
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace, TracebackType
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, Type
+from typing import (
+    Any,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Type,
+)
 
 from neo4j import AsyncGraphDatabase
 from neo4j.exceptions import ClientError
@@ -18,7 +26,7 @@ from langgraph.store.base import (  # type: ignore[attr-defined]
     Item,
 )
 
-from . import _VectorIndexConfig, _MemgraphStoreConnMixin
+from . import _MemgraphStoreConnMixin, _VectorIndexConfig
 from ._utils import parse_bolt_uri
 
 __all__ = ["AsyncMemgraphStore"]
@@ -27,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------- #
-# helper: detect duplicate‑schema errors so we can ignore them for idempotency
+# helper: detect duplicate‑schema errors (so we can ignore them for idempotency)
 # --------------------------------------------------------------------------- #
 def _is_duplicate_ddl(exc: ClientError) -> bool:  # pragma: no cover
     msg = str(exc).lower()
@@ -38,6 +46,17 @@ def _is_duplicate_ddl(exc: ClientError) -> bool:  # pragma: no cover
 #                             A S Y N C   S T O R E                          #
 # =========================================================================== #
 class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):  # type: ignore[misc]
+    """
+    Asynchronous Memgraph key–value store.
+
+    **Event‑loop safety**
+
+    * A separate Neo4j async driver is kept for **each event‑loop** that
+      touches the store.  This fully eliminates “Future attached to a different
+      loop” errors that occur when the same store instance is shared across
+      multiple loops (e.g. under `pytest‑asyncio`).
+    """
+
     # ------------------------------------------------------------------ #
     # construction
     # ------------------------------------------------------------------ #
@@ -52,39 +71,19 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):  # type: ignore[mi
         node_label: str | None = None,
         driver_kwargs: dict | None = None,
     ) -> None:
-        # -------------------------------------------------------------- #
-        # Align Neo4j driver with the *current* running event‑loop
-        # -------------------------------------------------------------- #
-        try:
-            running_loop = asyncio.get_running_loop()
-        except RuntimeError:
-            running_loop = None
-        else:
-            try:
-                if asyncio.get_event_loop() is not running_loop:
-                    asyncio.set_event_loop(running_loop)
-            except RuntimeError:
-                pass  # policy may forbid
+        # Connection details
+        self._bolt_uri = bolt_uri
+        self._user = user
+        self._password = password
+        self._driver_kwargs = driver_kwargs or {}
 
-        self._driver = AsyncGraphDatabase.driver(
-            bolt_uri, auth=(user, password), **(driver_kwargs or {})
-        )
-
-        # Patch every known loop container inside the driver so that all
-        # sockets & StreamReaders belong to the same loop used by pytest.
-        if running_loop is not None:
-            try:
-                pool = self._driver._pool  # type: ignore[attr-defined]
-                pool._loop = running_loop
-                if hasattr(pool, "_connector"):
-                    pool._connector._loop = running_loop  # type: ignore[attr-defined]
-            except AttributeError:
-                pass  # driver internals changed – ignore
+        # Neo4j drivers keyed by the owning event‑loop
+        self._drivers: dict[asyncio.AbstractEventLoop, Any] = {}
 
         if node_label:
             self.NODE_LABEL = str(node_label)
 
-        # optional vector‑index configuration
+        # Optional vector‑index configuration
         self._vector_cfg: _VectorIndexConfig | None = None
         if index:
             self._vector_cfg = _VectorIndexConfig(
@@ -95,7 +94,7 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):  # type: ignore[mi
                 embed=index.get("embed"),
             )
 
-        # TTL configuration wrapped in SimpleNamespace
+        # TTL configuration
         self._ttl_cfg: SimpleNamespace | None = None
         if ttl:
             _defaults = {
@@ -105,21 +104,50 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):  # type: ignore[mi
             }
             _defaults.update(ttl)
             self._ttl_cfg = SimpleNamespace(**_defaults)
+
         self._setup_done = False
         self._ttl_task: Optional[asyncio.Task[None]] = None
 
     # ------------------------------------------------------------------ #
-    # delegate robust Item builder from mix‑in
+    # driver helpers (one driver per event‑loop)
     # ------------------------------------------------------------------ #
-    _build_item = _MemgraphStoreConnMixin._build_item  # type: ignore
+    def _create_driver(self, loop: asyncio.AbstractEventLoop):
+        """Create a Neo4j async driver bound to *loop*."""
+        driver = AsyncGraphDatabase.driver(
+            self._bolt_uri, auth=(self._user, self._password), **self._driver_kwargs
+        )
+
+        # Patch driver internals so sockets & connectors share this loop
+        try:
+            pool = driver._pool  # type: ignore[attr-defined]
+            pool._loop = loop
+            if hasattr(pool, "_connector"):
+                pool._connector._loop = loop  # type: ignore[attr-defined]
+        except AttributeError:  # pragma: no cover
+            pass  # best‑effort only
+
+        return driver
+
+    def _get_driver(self):
+        loop = asyncio.get_running_loop()
+        if loop not in self._drivers:
+            self._drivers[loop] = self._create_driver(loop)
+        return self._drivers[loop]
+
+    # Expose property so existing code (`self._driver`) continues to work
+    @property
+    def _driver(self):
+        return self._get_driver()
 
     # ------------------------------------------------------------------ #
     # builders
     # ------------------------------------------------------------------ #
     @classmethod
     def from_conn_string(cls, conn: str, **kwargs: Any) -> "AsyncMemgraphStore":
-        p = parse_bolt_uri(conn)
-        return cls(p["bolt_uri"], user=p["user"], password=p["password"], **kwargs)
+        parsed = parse_bolt_uri(conn)
+        return cls(
+            parsed["bolt_uri"], user=parsed["user"], password=parsed["password"], **kwargs
+        )
 
     # ------------------------------------------------------------------ #
     # async context
@@ -143,11 +171,15 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):  # type: ignore[mi
             self._ttl_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._ttl_task
-        try:
-            await self._driver.close()
-        except RuntimeError as exc:  # pragma: no cover
-            if "event loop is closed" not in str(exc).lower():
-                raise
+
+        # Close all cached drivers
+        for drv in list(self._drivers.values()):
+            try:
+                await drv.close()
+            except RuntimeError as exc:  # pragma: no cover
+                if "event loop is closed" not in str(exc).lower():
+                    raise
+        self._drivers.clear()
 
     # ------------------------------------------------------------------ #
     # schema / setup
@@ -157,8 +189,7 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):  # type: ignore[mi
         if self._setup_done:
             return
 
-        async with self._driver.session() as sess:
-
+        async with self._driver.session() as sess:  # type: ignore[attr-defined]
             async def run_safe(cypher: str) -> None:
                 try:
                     result = await sess.run(cypher)
@@ -190,7 +221,7 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):  # type: ignore[mi
     # TTL SWEEPER
     # ============================================================ #
     def _start_ttl_sweeper(self) -> None:
-        if self._ttl_task:
+        if self._ttl_task or not self._ttl_cfg or not self._ttl_cfg.sweep_interval_minutes:
             return
 
         async def _loop() -> None:
@@ -206,16 +237,18 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):  # type: ignore[mi
         self._ttl_task = asyncio.create_task(_loop())
 
     async def sweep_ttl(self) -> None:
-        async with self._driver.session() as sess:
+        async with self._driver.session() as sess:  # type: ignore[attr-defined]
             async def _tx(tx):
-                result = await tx.run(
-                    f"""
-                    MATCH (n:{self.NODE_LABEL})
-                    WHERE n.expire_at IS NOT NULL AND n.expire_at < datetime()
-                    DETACH DELETE n
-                    """
-                )
-                await result.consume()
+                await (
+                    await tx.run(
+                        f"""
+                        MATCH (n:{self.NODE_LABEL})
+                        WHERE n.expire_at IS NOT NULL AND n.expire_at < datetime()
+                        DETACH DELETE n
+                        """
+                    )
+                ).consume()
+
             await sess.execute_write(_tx)
 
     # ============================================================ #
@@ -230,18 +263,19 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):  # type: ignore[mi
 
     async def _refresh_node_ttl(self, namespace: Tuple[str, ...], key: str) -> None:
         exp = self._expiry_dt(None)
-        async with self._driver.session() as sess:
-            result = await sess.run(
-                f"""
-                MATCH (n:{self.NODE_LABEL})
-                WHERE n.namespace = $ns AND n.key = $key
-                SET n.expire_at = datetime($exp)
-                """,
-                ns=list(namespace),
-                key=key,
-                exp=exp,
-            )
-            await result.consume()
+        async with self._driver.session() as sess:  # type: ignore[attr-defined]
+            await (
+                await sess.run(
+                    f"""
+                    MATCH (n:{self.NODE_LABEL})
+                    WHERE n.namespace = $ns AND n.key = $key
+                    SET n.expire_at = datetime($exp)
+                    """,
+                    ns=list(namespace),
+                    key=key,
+                    exp=exp,
+                )
+            ).consume()
 
     # ============================================================ #
     # CRUD: PUT
@@ -269,39 +303,43 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):  # type: ignore[mi
 
         exp = self._expiry_dt(ttl)
 
-        async with self._driver.session() as sess:
+        async with self._driver.session() as sess:  # type: ignore[attr-defined]
 
             async def _tx(tx):  # type: ignore[valid-type]
-                result1 = await tx.run(
-                    f"""
-                    MATCH (n:{self.NODE_LABEL})
-                    WHERE n.namespace = $ns AND n.key = $key
-                    DETACH DELETE n
-                    """,
-                    ns=list(namespace),
-                    key=key,
-                )
-                await result1.consume()
+                # Delete existing node (if any)
+                await (
+                    await tx.run(
+                        f"""
+                        MATCH (n:{self.NODE_LABEL})
+                        WHERE n.namespace = $ns AND n.key = $key
+                        DETACH DELETE n
+                        """,
+                        ns=list(namespace),
+                        key=key,
+                    )
+                ).consume()
 
-                result2 = await tx.run(
-                    f"""
-                    CREATE (n:{self.NODE_LABEL} {{
-                        namespace: $ns,
-                        key: $key,
-                        value: $val,
-                        expire_at: (
-                            CASE WHEN $exp IS NULL THEN NULL ELSE datetime($exp) END
-                        ),
-                        embedding: $embedding
-                    }})
-                    """,
-                    ns=list(namespace),
-                    key=key,
-                    val=value_json,
-                    exp=exp,
-                    embedding=embed_vec,
-                )
-                await result2.consume()
+                # Create new node
+                await (
+                    await tx.run(
+                        f"""
+                        CREATE (n:{self.NODE_LABEL} {{
+                            namespace: $ns,
+                            key: $key,
+                            value: $val,
+                            expire_at: (
+                                CASE WHEN $exp IS NULL THEN NULL ELSE datetime($exp) END
+                            ),
+                            embedding: $embedding
+                        }})
+                        """,
+                        ns=list(namespace),
+                        key=key,
+                        val=value_json,
+                        exp=exp,
+                        embedding=embed_vec,
+                    )
+                ).consume()
 
             await sess.execute_write(_tx)
 
@@ -333,7 +371,7 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):  # type: ignore[mi
         *,
         refresh_ttl: bool | None = None,
     ) -> Optional[Item]:
-        async with self._driver.session() as sess:
+        async with self._driver.session() as sess:  # type: ignore[attr-defined]
 
             async def _read(tx):
                 r = await tx.run(
@@ -368,7 +406,7 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):  # type: ignore[mi
         )
 
     async def aexists(self, namespace: Tuple[str, ...], key: str) -> bool:
-        async with self._driver.session() as sess:
+        async with self._driver.session() as sess:  # type: ignore[attr-defined]
             rec = await sess.run(
                 f"""
                 MATCH (n:{self.NODE_LABEL})
@@ -378,12 +416,11 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):  # type: ignore[mi
                 ns=list(namespace),
                 key=key,
             )
-            result = await rec.single()
-            return result is not None
+            return (await rec.single()) is not None
 
     async def acount(self, namespace_prefix: Tuple[str, ...]) -> int:
         pred = self._cypher_ns_prefix_filter(namespace_prefix)
-        async with self._driver.session() as sess:
+        async with self._driver.session() as sess:  # type: ignore[attr-defined]
             rec = await sess.run(
                 f"""
                 MATCH (n:{self.NODE_LABEL})
@@ -399,7 +436,7 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):  # type: ignore[mi
     # ============================================================ #
     async def alist_keys(self, namespace: Tuple[str, ...]) -> List[str]:
         pred = self._cypher_ns_prefix_filter(namespace)
-        async with self._driver.session() as sess:
+        async with self._driver.session() as sess:  # type: ignore[attr-defined]
             res = await sess.run(
                 f"""
                 MATCH (n:{self.NODE_LABEL})
@@ -412,7 +449,7 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):  # type: ignore[mi
     async def alist_items(self, namespace: Tuple[str, ...]) -> List[Item]:
         pred = self._cypher_ns_prefix_filter(namespace)
         items: List[Item] = []
-        async with self._driver.session() as sess:
+        async with self._driver.session() as sess:  # type: ignore[attr-defined]
             res = await sess.run(
                 f"""
                 MATCH (n:{self.NODE_LABEL})
@@ -436,32 +473,36 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):  # type: ignore[mi
     # CRUD: DELETE
     # ============================================================ #
     async def adelete(self, namespace: Tuple[str, ...], key: str) -> None:
-        async with self._driver.session() as sess:
+        async with self._driver.session() as sess:  # type: ignore[attr-defined]
             async def _tx(tx):
-                result = await tx.run(
-                    f"""
-                    MATCH (n:{self.NODE_LABEL})
-                    WHERE n.namespace = $ns AND n.key = $key
-                    DETACH DELETE n
-                    """,
-                    ns=list(namespace),
-                    key=key,
-                )
-                await result.consume()
+                await (
+                    await tx.run(
+                        f"""
+                        MATCH (n:{self.NODE_LABEL})
+                        WHERE n.namespace = $ns AND n.key = $key
+                        DETACH DELETE n
+                        """,
+                        ns=list(namespace),
+                        key=key,
+                    )
+                ).consume()
+
             await sess.execute_write(_tx)
 
     async def adelete_namespace(self, namespace_prefix: Tuple[str, ...]) -> None:
         pred = self._cypher_ns_prefix_filter(namespace_prefix)
-        async with self._driver.session() as sess:
+        async with self._driver.session() as sess:  # type: ignore[attr-defined]
             async def _tx(tx):
-                result = await tx.run(
-                    f"""
-                    MATCH (n:{self.NODE_LABEL})
-                    WHERE {pred}
-                    DETACH DELETE n
-                    """
-                )
-                await result.consume()
+                await (
+                    await tx.run(
+                        f"""
+                        MATCH (n:{self.NODE_LABEL})
+                        WHERE {pred}
+                        DETACH DELETE n
+                        """
+                    )
+                ).consume()
+
             await sess.execute_write(_tx)
 
     # ============================================================ #
@@ -471,7 +512,7 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):  # type: ignore[mi
         self,
         namespace_prefix: Tuple[str, ...],
         *,
-        query: str | List[float] | None = None,
+        query: str | Sequence[float] | None = None,
         filter: Mapping[str, Any] | None = None,
         limit: int = 10,
         offset: int = 0,
@@ -507,7 +548,7 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):  # type: ignore[mi
                 ORDER BY similarity DESC
                 LIMIT $k
             """
-            async with self._driver.session() as sess:
+            async with self._driver.session() as sess:  # type: ignore[attr-defined]
                 res = await sess.run(cypher, **params)
                 rows = await res.data()
                 for rec in rows[offset : offset + limit]:
@@ -547,7 +588,7 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):  # type: ignore[mi
             SKIP $offset
             LIMIT $limit
         """
-        async with self._driver.session() as sess:
+        async with self._driver.session() as sess:  # type: ignore[attr-defined]
             res = await sess.run(cypher, **params)
             async for rec in res:
                 n = rec["n"]
@@ -588,6 +629,7 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):  # type: ignore[mi
                 raise ValueError(f"Invalid operation format: {op}")
         return results
 
+    # Sync façade for non‑async callers
     def batch(self, ops: Iterable[Any]) -> list[Any]:
         import asyncio
 

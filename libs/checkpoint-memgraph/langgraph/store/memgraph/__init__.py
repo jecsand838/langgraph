@@ -1,6 +1,15 @@
-# libs/checkpoint-memgraph/langgraph/store/memgraph/__init__.py
 """
 Synchronous Memgraph key–value store used by LangGraph memory components.
+
+Key refactor features
+--------------------
+* Safe Cypher parameter binding – avoids reserved names such as ``query``.
+* Modular hybrid search:
+    - ``_vector_search`` handles semantic / vector retrieval.
+    - ``_lexical_search`` handles keyword / fallback retrieval.
+* Automatic degradation: if no embedder or vector index is available,
+  text queries fall back to lexical search instead of raising.
+* Thorough type checking and clear error messages for unsupported inputs.
 """
 
 from __future__ import annotations
@@ -22,6 +31,7 @@ from typing import (
     Sequence,
     Tuple,
     Type,
+    Union,
 )
 
 from neo4j import GraphDatabase, Session, Transaction
@@ -73,10 +83,8 @@ class _MemgraphStoreConnMixin:
         score: Optional[float] = None,
         expires_at: Optional[str] = None,
     ) -> Item:
-        """
-        Build an :class:`langgraph.store.base.Item` that is compatible with all
-        LangGraph releases (the class signature has changed a few times).
-        """
+        """Instantiate an :class:`langgraph.store.base.Item` compatible with all
+        LangGraph releases."""
         # Detect supported/required fields
         if is_dataclass(Item):
             item_field_names = {f.name for f in fields(Item)}
@@ -98,7 +106,7 @@ class _MemgraphStoreConnMixin:
                     kwargs[cand] = expires_at
                     break
 
-        # Provide defaults for *required* keyword‑only params (e.g. created_at)
+        # Provide defaults for *required* keyword‑only params
         sig = inspect.signature(Item)
         for name, param in sig.parameters.items():
             if (
@@ -169,6 +177,17 @@ class _MemgraphStoreConnMixin:
 #                              S Y N C   S T O R E                           #
 # =========================================================================== #
 class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):  # type: ignore[misc]
+    """
+    Synchronous Memgraph‑backed store with hybrid (vector + lexical) search.
+
+    ``search`` decides on vector vs. lexical path automatically:
+
+    * *Text + embedder*  → semantic vector search.
+    * *Text (no embedder)* → lexical ``CONTAINS`` search.
+    * *Vector input*     → direct vector similarity search.
+    * *None*             → list items in namespace.
+    """
+
     # ------------------------------------------------------------------ #
     # construction
     # ------------------------------------------------------------------ #
@@ -268,7 +287,7 @@ class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):  # type: ignore[misc]
         return self.batch(ops)
 
     # ------------------------------------------------------------------ #
-    # driver lifecycle
+    # driver lifecycle / setup
     # ------------------------------------------------------------------ #
     def close(self) -> None:
         if self._ttl_thread and self._ttl_thread.is_alive():
@@ -276,9 +295,6 @@ class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):  # type: ignore[misc]
             self._ttl_thread.join(timeout=5)
         self._driver.close()
 
-    # ============================================================ #
-    # schema / setup
-    # ============================================================ #
     def setup(self) -> None:
         if self._setup_done:
             return
@@ -290,9 +306,9 @@ class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):  # type: ignore[misc]
 
     initialise = setup  # alias
 
-    # ============================================================ #
-    # TTL SWEEPER
-    # ============================================================ #
+    # ------------------------------------------------------------------ #
+    # TTL sweeper (optional background thread)
+    # ------------------------------------------------------------------ #
     def _start_ttl_sweeper(self) -> None:
         if self._ttl_thread and self._ttl_thread.is_alive():
             return
@@ -324,9 +340,9 @@ class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):  # type: ignore[misc]
                 )
             )
 
-    # ============================================================ #
+    # ------------------------------------------------------------------ #
     # internal helpers
-    # ============================================================ #
+    # ------------------------------------------------------------------ #
     def _expiry_dt(self, ttl_minutes: float | None) -> Optional[str]:
         if ttl_minutes is None and self._ttl_cfg:
             ttl_minutes = self._ttl_cfg.default_ttl
@@ -348,9 +364,9 @@ class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):  # type: ignore[misc]
                 exp=exp,
             )
 
-    # ============================================================ #
+    # ------------------------------------------------------------------ #
     # new: list distinct namespaces
-    # ============================================================ #
+    # ------------------------------------------------------------------ #
     def list_namespaces(self, namespace_prefix: Tuple[str, ...]) -> List[Tuple[str, ...]]:
         pred = self._cypher_ns_prefix_filter(namespace_prefix)
         with self._driver.session() as sess:
@@ -363,9 +379,9 @@ class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):  # type: ignore[misc]
             )
             return [tuple(r["ns"]) for r in res]
 
-    # ============================================================ #
+    # ------------------------------------------------------------------ #
     # CRUD
-    # ============================================================ #
+    # ------------------------------------------------------------------ #
     def put(
         self,
         namespace: Tuple[str, ...],
@@ -591,92 +607,169 @@ class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):  # type: ignore[misc]
                 )
             )
 
-    # ------------------------------------------------------------------ #
-    # SEARCH (vector + lexical)
-    # ------------------------------------------------------------------ #
+    # ============================================================ #
+    # SEARCH – public dispatcher
+    # ============================================================ #
     def search(
         self,
         namespace_prefix: Tuple[str, ...],
         *,
-        query: str | Sequence[float] | None = None,
+        query: Union[str, Sequence[float], None] = None,
         filter: Mapping[str, Any] | None = None,
         limit: int = 10,
         offset: int = 0,
         refresh_ttl: bool | None = None,
     ) -> List[Item]:
-        pred = self._cypher_ns_prefix_filter(namespace_prefix)
-        items: List[Item] = []
+        """Hybrid lexical / semantic search (see class docstring)."""
+        if isinstance(query, str):
+            if self._vector_cfg and self._vector_cfg.embed:
+                # Semantic path
+                return self._vector_search(
+                    namespace_prefix,
+                    text=query,
+                    filter=filter,
+                    limit=limit,
+                    offset=offset,
+                    refresh_ttl=refresh_ttl,
+                )
+            # Lexical fallback
+            return self._lexical_search(
+                namespace_prefix,
+                term=query,
+                filter=filter,
+                limit=limit,
+                offset=offset,
+                refresh_ttl=refresh_ttl,
+            )
 
-        # ---------- vector branch ----------
-        if (
-            query is not None
-            and self._vector_cfg
-            and self._vector_cfg.embed
-            and isinstance(query, str)
-        ):
-            q_vec = self._vector_cfg.embed.embed_query(query)  # type: ignore[attr-defined]
-            if hasattr(q_vec, "tolist"):
-                q_vec = q_vec.tolist()
-            k = limit + offset
-            params: Dict[str, Any] = {"vec": q_vec, "k": k}
-            cypher = f"""
-                CALL vector_search.search("{self._vector_cfg.name}", $k, $vec)
-                YIELD node, similarity
-                WITH node, similarity
-                WHERE {pred}
-            """
-            if filter:
-                for fk, fv in filter.items():
-                    cypher += f" AND node.{fk} = ${fk} "
-                    params[fk] = fv
-            cypher += """
-                RETURN node, similarity
-                ORDER BY similarity DESC
-                LIMIT $k
-            """
-            with self._driver.session() as sess:
-                result = sess.run(cypher, **params)
-                rows = result.data()
-                for rec in rows[offset : offset + limit]:
-                    n = rec["node"]
-                    if refresh_ttl or (
-                        refresh_ttl is None
-                        and self._ttl_cfg
-                        and self._ttl_cfg.refresh_on_read
-                    ):
-                        self._refresh_node_ttl(tuple(n["namespace"]), n["key"])
-                    items.append(
-                        self._build_item(
-                            namespace=tuple(n["namespace"]),
-                            key=n["key"],
-                            value=json.loads(n["value"]),
-                            score=rec["similarity"],
-                            expires_at=n.get("expire_at"),
-                        )
-                    )
-            return items
+        if isinstance(query, Sequence) and not isinstance(query, (str, bytes)):
+            if not self._vector_cfg:
+                raise ValueError("Vector query supplied but no vector index configured.")
+            return self._vector_search(
+                namespace_prefix,
+                vector=list(query),
+                filter=filter,
+                limit=limit,
+                offset=offset,
+                refresh_ttl=refresh_ttl,
+            )
+        # query is None → list
+        return self._lexical_search(
+            namespace_prefix,
+            term=None,
+            filter=filter,
+            limit=limit,
+            offset=offset,
+            refresh_ttl=refresh_ttl,
+        )
 
-        # ---------- lexical branch ----------
-        params: Dict[str, Any] = {"limit": limit, "offset": offset}
-        cypher = f"""
-            MATCH (n:{self.NODE_LABEL})
-            WHERE {pred}
+    # ============================================================ #
+    # Internal helpers – search variants
+    # ============================================================ #
+    def _vector_search(
+        self,
+        namespace_prefix: Tuple[str, ...],
+        *,
+        text: Optional[str] = None,
+        vector: Optional[List[float]] = None,
+        filter: Mapping[str, Any] | None,
+        limit: int,
+        offset: int,
+        refresh_ttl: bool | None,
+    ) -> List[Item]:
+        """Vector similarity search (text is embedded if provided)."""
+        if not self._vector_cfg:
+            raise RuntimeError("Vector search requested but no vector index configured.")
+
+        if vector is not None and text is not None:
+            raise ValueError("Provide either *text* or *vector* (not both).")
+
+        if text is not None:
+            if not self._vector_cfg.embed:
+                raise RuntimeError("Embedder not configured.")
+            vector = self._vector_cfg.embed.embed_query(text)  # type: ignore[attr-defined]
+            if hasattr(vector, "tolist"):
+                vector = vector.tolist()
+
+        if vector is None:
+            raise ValueError("Vector search requires a vector.")
+
+        k = limit + offset
+        params: Dict[str, Any] = {"vec": vector, "k": k}
+        cypher = (
+            f"""
+            CALL vector_search.search("{self._vector_cfg.name}", $k, $vec)
+            YIELD node, similarity
+            WITH node, similarity
+            WHERE {self._cypher_ns_prefix_filter(namespace_prefix)}
+            """
+        )
+        if filter:
+            for fk, fv in filter.items():
+                cypher += f" AND node.{fk} = ${fk} "
+                params[fk] = fv
+        cypher += """
+            RETURN node, similarity
+            ORDER BY similarity DESC
+            LIMIT $k
         """
-        if query:
-            cypher += " AND n.value CONTAINS $query "
-            params["query"] = query
+
+        items: List[Item] = []
+        with self._driver.session() as sess:
+            rows = sess.run(cypher, parameters=params).data()
+            for rec in rows[offset : offset + limit]:
+                n = rec["node"]
+                if refresh_ttl or (
+                    refresh_ttl is None
+                    and self._ttl_cfg
+                    and self._ttl_cfg.refresh_on_read
+                ):
+                    self._refresh_node_ttl(tuple(n["namespace"]), n["key"])
+                items.append(
+                    self._build_item(
+                        namespace=tuple(n["namespace"]),
+                        key=n["key"],
+                        value=json.loads(n["value"]),
+                        score=rec["similarity"],
+                        expires_at=n.get("expire_at"),
+                    )
+                )
+        return items
+
+    def _lexical_search(
+        self,
+        namespace_prefix: Tuple[str, ...],
+        *,
+        term: Optional[str],
+        filter: Mapping[str, Any] | None,
+        limit: int,
+        offset: int,
+        refresh_ttl: bool | None,
+    ) -> List[Item]:
+        """Simple substring search on the JSON stringified `value`."""
+        params: Dict[str, Any] = {"lim": limit, "off": offset}
+        cypher = (
+            f"""
+            MATCH (n:{self.NODE_LABEL})
+            WHERE {self._cypher_ns_prefix_filter(namespace_prefix)}
+            """
+        )
+        if term:
+            cypher += " AND n.value CONTAINS $term "
+            params["term"] = term
         if filter:
             for fk, fv in filter.items():
                 cypher += f" AND n.{fk} = ${fk} "
                 params[fk] = fv
         cypher += """
             RETURN n
-            SKIP $offset
-            LIMIT $limit
+            SKIP $off
+            LIMIT $lim
         """
+
+        items: List[Item] = []
         with self._driver.session() as sess:
-            result = sess.run(cypher, **params)
-            for rec in result:
+            for rec in sess.run(cypher, parameters=params):
                 n = rec["n"]
                 if refresh_ttl or (
                     refresh_ttl is None

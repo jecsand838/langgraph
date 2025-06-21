@@ -7,7 +7,7 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
-from typing import Iterable, Tuple, Any, AsyncGenerator
+from typing import Iterable, Tuple, Any, AsyncGenerator, Generator
 
 import pytest
 
@@ -33,10 +33,11 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-# --------------------------------------------------------------------------- #
-@pytest.fixture(scope="module")
-def event_loop() -> Iterable[asyncio.AbstractEventLoop]:  # pytest‑asyncio default
-    loop = asyncio.new_event_loop()
+# ----------------------------------------------------------------及ひ---- #
+@pytest.fixture(scope="function")
+def event_loop() -> Generator[asyncio.AbstractEventLoop, None, None]:
+    """Create an instance of the default event loop for each test case."""
+    loop = asyncio.get_event_loop_policy().new_event_loop()
     yield loop
     loop.close()
 
