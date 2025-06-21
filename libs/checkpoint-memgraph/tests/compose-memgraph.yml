@@ -1,15 +1,14 @@
 services:
   memgraph:
-    image: memgraph/memgraph-mage:3.3
+    image: memgraph/memgraph-mage:${MEMGRAPH_VERSION:-3.3}
     container_name: memgraph-mage
     ports:
       - "7687:7687"
       - "7444:7444"
     command: ["--log-level=TRACE"]
     environment:
-      - MEMGRAPH_USER=testuser123
-      - MEMGRAPH_PASSWORD=BiggerPassword1233
-
+      - MEMGRAPH_USER=memgraph
+      - MEMGRAPH_PASSWORD=memgraph
     healthcheck:
       test: ["CMD-SHELL",
              "echo 'RETURN 1;' | mgconsole --host 127.0.0.1 \
@@ -17,29 +16,10 @@ services:
                                           --username \"$${MEMGRAPH_USER}\" \
                                           --password \"$${MEMGRAPH_PASSWORD}\" \
                                           >/dev/null 2>&1"]
-      interval: 10s         # run every 10 s
-      timeout: 5s           # abort probe after 5 s
-      start_period: 20s     # give the DB 20 s to finish booting
-      retries: 5            # mark container unhealthy only after 5 consecutive failures
-
-  lab:
-    image: memgraph/lab:3.3.0
-    container_name: memgraph-lab
-    ports:
-      - "3000:3000"
-    depends_on:
-      memgraph:
-        condition: service_healthy
-    environment:
-      - QUICK_CONNECT_MG_HOST=memgraph
-      - QUICK_CONNECT_MG_PORT=7687
-
-    healthcheck:            # optional UI probe
-      test: ["CMD-SHELL", "wget -q -O - http://localhost:3000/ || exit 1"]
-      interval: 30s
+      interval: 10s
       timeout: 5s
+      start_period: 20s
       retries: 5
-      start_period: 10s
 
 volumes:
   neo4j_data:

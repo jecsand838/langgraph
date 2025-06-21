@@ -1,50 +1,22 @@
-# libs/checkpoint-memgraph/tests/store/test_async_memgraph_store.py
 """
 Integration tests for the asynchronous AsyncMemgraphStore.
 """
 from __future__ import annotations
 
-import asyncio
 import os
 import uuid
-from typing import Iterable, Tuple, Any, AsyncGenerator, Generator
+from typing import AsyncGenerator, Tuple
 
 import pytest
 
 from langgraph.store.memgraph.aio import AsyncMemgraphStore
-
-# --------------------------------------------------------------------------- #
-BOLT_URI = os.getenv(
-    "MEMGRAPH_BOLT_URI", "bolt://testuser123:BiggerPassword1233@localhost:7687"
-)
+from tests.conftest import DEFAULT_MEMGRAPH_URI
 
 
-def _have_db() -> bool:
-    try:
-        st = AsyncMemgraphStore.from_conn_string(BOLT_URI)
-        asyncio.get_event_loop().run_until_complete(st.close())
-        return True
-    except Exception:
-        return False
-
-
-pytestmark = pytest.mark.skipif(
-    not _have_db(), reason="Memgraph instance not reachable on localhost"
-)
-
-
-# ----------------------------------------------------------------及ひ---- #
-@pytest.fixture(scope="function")
-def event_loop() -> Generator[asyncio.AbstractEventLoop, None, None]:
-    """Create an instance of the default event loop for each test case."""
-    loop = asyncio.get_event_loop_policy().new_event_loop()
-    yield loop
-    loop.close()
-
-
-@pytest.fixture(scope="module")
+@pytest.fixture
 async def astore() -> AsyncGenerator[AsyncMemgraphStore, None]:
-    st = AsyncMemgraphStore.from_conn_string(BOLT_URI)
+    """Function-scoped AsyncMemgraphStore fixture."""
+    st = AsyncMemgraphStore.from_conn_string(DEFAULT_MEMGRAPH_URI)
     await st.setup()
     yield st
     await st.close()
@@ -54,7 +26,6 @@ def _ns() -> Tuple[str, ...]:
     return "async-tests", str(uuid.uuid4())
 
 
-# --------------------------------------------------------------------------- #
 @pytest.mark.asyncio
 async def test_async_put_get(astore: AsyncMemgraphStore) -> None:
     ns = _ns()

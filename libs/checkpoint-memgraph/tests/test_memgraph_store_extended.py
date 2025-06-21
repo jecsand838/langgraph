@@ -1,4 +1,3 @@
-# libs/checkpoint-memgraph/tests/test_memgraph_store_extended.py
 """
 Extended integration tests for the synchronous ``MemgraphStore``.
 
@@ -19,46 +18,23 @@ from __future__ import annotations
 
 import os
 import uuid
-from typing import Iterable, Tuple
+from typing import Tuple, Any, Generator
 
 import pytest
 
 from langgraph.store.memgraph import MemgraphStore
-
-# --------------------------------------------------------------------------- #
-# Connection details (overridable via env var)
-# --------------------------------------------------------------------------- #
-BOLT_URI = os.getenv(
-    "MEMGRAPH_BOLT_URI", "bolt://testuser123:BiggerPassword1233@localhost:7687"
-)
+from tests.conftest import DEFAULT_MEMGRAPH_URI
 
 
-def _have_db() -> bool:
-    """Quick connectivity probe so CI can gracefully skip when DB unavailable."""
-    try:
-        st = MemgraphStore.from_conn_string(BOLT_URI)
-        st.close()
-        return True
-    except Exception:
-        return False
-
-
-pytestmark = pytest.mark.skipif(
-    not _have_db(), reason="Memgraph instance not reachable on localhost"
-)
-
-# --------------------------------------------------------------------------- #
-# Test fixtures
-# --------------------------------------------------------------------------- #
-@pytest.fixture(scope="module")
-def store() -> Iterable[MemgraphStore]:
+@pytest.fixture
+def store() -> Generator[MemgraphStore, Any, None]:
     """
-    Provide a configured ``MemgraphStore`` for the entire module.
+    Provide a configured ``MemgraphStore`` for each test.
 
     Each test receives its own randomly‑generated namespace prefix to avoid any
     cross‑test interference.
     """
-    st = MemgraphStore.from_conn_string(BOLT_URI)
+    st = MemgraphStore.from_conn_string(DEFAULT_MEMGRAPH_URI)
     st.setup()
     yield st
     st.close()
@@ -66,12 +42,9 @@ def store() -> Iterable[MemgraphStore]:
 
 def _ns() -> Tuple[str, ...]:
     """Generate a unique namespace for every test."""
-    return ("tests", str(uuid.uuid4()))
+    return "tests", str(uuid.uuid4())
 
 
-# --------------------------------------------------------------------------- #
-# CRUD & helper tests
-# --------------------------------------------------------------------------- #
 def test_exists_and_count(store: MemgraphStore) -> None:
     ns = _ns()
     store.put(ns, "k1", {"foo": 1})
@@ -119,9 +92,6 @@ def test_delete_namespace(store: MemgraphStore) -> None:
     assert store.count(ns_child) == 0
 
 
-# --------------------------------------------------------------------------- #
-# SEARCH tests (lexical / hybrid)
-# --------------------------------------------------------------------------- #
 def test_search_lexical_basic(store: MemgraphStore) -> None:
     """Plain text query should hit lexical path when no embedder configured."""
     ns = _ns()

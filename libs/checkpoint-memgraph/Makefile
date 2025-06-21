@@ -11,7 +11,7 @@
 # - The docker‑compose file is located at tests/compose‑memgraph.yml.
 # -------------------------------------------------------------------------
 start-memgraph:
-	MEMGRAPH_VERSION=${MEMGRAPH_VERSION:-2.13} docker compose -f tests/compose-memgraph.yml up -V --force-recreate --wait || ( \
+	MEMGRAPH_VERSION=${MEMGRAPH_VERSION:-3.3} docker compose -f tests/compose-memgraph.yml up -V --force-recreate --wait || ( \
 		echo "Failed to start Memgraph, printing logs..."; \
 		docker compose -f tests/compose-memgraph.yml logs; \
 		exit 1 \
@@ -24,7 +24,7 @@ stop-memgraph:
 # Run the full test-suite against a matrix of Memgraph versions.
 # Adjust MEMGRAPH_VERSIONS if you need a different matrix.
 # -------------------------------------------------------------------------
-MEMGRAPH_VERSIONS ?= 2.11 2.12 2.13
+MEMGRAPH_VERSIONS ?= 3.1 3.2 3.3
 
 test_memgraph_version:
 	@echo "Testing Memgraph $(MEMGRAPH_VERSION)"
