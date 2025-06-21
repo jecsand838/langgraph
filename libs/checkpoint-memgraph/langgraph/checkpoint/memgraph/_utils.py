@@ -1,4 +1,3 @@
-# libs/checkpoint-memgraph/langgraph/checkpoint/memgraph/_utils.py
 """Utility helpers for Memgraph checkpoint back‑end."""
 
 from __future__ import annotations

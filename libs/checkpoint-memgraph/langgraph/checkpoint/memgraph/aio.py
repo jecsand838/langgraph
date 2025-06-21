@@ -1,308 +1,103 @@
-"""Asynchronous Memgraph checkpoint saver (feature‑parity with sync version).
-
-Key fixes (2025‑06‑21)
-──────────────────────
-• Added `_require_checkpoint_id` guard in `aput_writes`; raises a clear
-  `ValueError` if a caller forgets to persist a checkpoint first.
-• Re‑worked `aput_writes` Cypher so the MERGE of `Write` and creation of the
-  relationship to its parent `Checkpoint` happen in a *single* statement,
-  eliminating the Memgraph.ExecutionException seen with `WITH … MATCH`.
-• Added debug‑level logging statements mirroring the synchronous saver.
-• Relies on improved (de)serialization helpers in BaseMemgraphSaver that skip
-  NULL placeholder rows, eliminating the “Unknown serialization type: None”
-  runtime error.
-"""
 from __future__ import annotations
 
 import asyncio
-import logging
+from collections import defaultdict
+from collections.abc import AsyncIterator, Iterator, Sequence
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, Sequence
+from typing import Any, Dict
 
-from neo4j import AsyncDriver, AsyncGraphDatabase, AsyncSession
-from neo4j.exceptions import ClientError
+from neo4j import AsyncDriver, AsyncGraphDatabase, AsyncTransaction
 
 from langchain_core.runnables import RunnableConfig
 
 from langgraph.checkpoint.base import (
+    WRITES_IDX_MAP,
     ChannelVersions,
     Checkpoint,
     CheckpointMetadata,
     CheckpointTuple,
+    get_checkpoint_id,
     get_checkpoint_metadata,
 )
-from langgraph.checkpoint.memgraph import _ainternal
-from langgraph.checkpoint.memgraph.base import BaseMemgraphSaver
-from langgraph.checkpoint.memgraph.saver import _is_dup_ddl  # reuse helper
+from langgraph.checkpoint.serde.base import SerializerProtocol
+from langgraph.checkpoint.serde.types import TASKS
 
-logger = logging.getLogger(__name__)
+from .base import BaseMemgraphSaver
 
 
 class AsyncMemgraphSaver(BaseMemgraphSaver):
-    """Async variant that offers the same public API as `MemgraphSaver`."""
+    """Asynchronous checkpointer that stores checkpoints in a Memgraph database."""
 
+    driver: AsyncDriver
     lock: asyncio.Lock
+    loop: asyncio.AbstractEventLoop
 
-    # ─────────────────────────────────────────────────────────────────── #
-    # Construction / factory helpers
-    # ─────────────────────────────────────────────────────────────────── #
-    def __init__(self, conn: _ainternal.Conn, *, serde=None) -> None:
+    def __init__(
+        self,
+        driver: AsyncDriver,
+        *,
+        serde: SerializerProtocol | None = None,
+    ) -> None:
+        """
+        Initialize the async Memgraph saver.
+
+        Args:
+            driver: The neo4j.AsyncDriver instance to connect to the database.
+            serde: The serializer to use for checkpoint data. Defaults to a JSON serializer.
+        """
         super().__init__(serde=serde)
-        self.conn = conn
+        self.driver = driver
         self.lock = asyncio.Lock()
-        self.loop = asyncio.get_event_loop()
+        try:
+            self.loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # This is to allow usage in a non-async context (e.g., in a background thread)
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
 
     @classmethod
     @asynccontextmanager
     async def from_conn_string(
-        cls, bolt_uri: str, **driver_kwargs: Any
-    ) -> AsyncIterator["AsyncMemgraphSaver"]:
-        driver: AsyncDriver = AsyncGraphDatabase.driver(  # type: ignore[arg-type]
-            bolt_uri, **driver_kwargs
-        )
+        cls, conn_string: str, *, serde: SerializerProtocol | None = None
+    ) -> AsyncIterator[AsyncMemgraphSaver]:
+        """
+        Create a new AsyncMemgraphSaver instance from a connection string.
+
+        Args:
+            conn_string: The Memgraph connection URI (e.g., "bolt://localhost:7687").
+            serde: The serializer to use.
+
+        Yields:
+            An AsyncMemgraphSaver instance.
+        """
+        driver = AsyncGraphDatabase.driver(conn_string)
         try:
-            yield cls(driver)
+            yield cls(driver=driver, serde=serde)
         finally:
             await driver.close()
 
-    # ─────────────────────────────────────────────────────────────────── #
-    # Internal helpers
-    # ─────────────────────────────────────────────────────────────────── #
-    @staticmethod
-    def _require_checkpoint_id(config: RunnableConfig) -> str:
-        try:
-            return config["configurable"]["checkpoint_id"]
-        except KeyError as exc:  # pragma: no cover
-            raise ValueError(
-                "AsyncMemgraphSaver.aput_writes requires "
-                "`config['configurable']['checkpoint_id']` – "
-                "call `await saver.aput(...)` first."
-            ) from exc
-
-    # ─────────────────────────────────────────────────────────────────── #
-    # Schema initialisation
-    # ─────────────────────────────────────────────────────────────────── #
     async def setup(self) -> None:
-        async with _ainternal.get_connection(self.conn) as sess:
-
-            async def run_safe(cypher: str) -> None:
-                try:
-                    await sess.run(cypher)
-                except ClientError as exc:  # pragma: no cover
-                    if not _is_dup_ddl(exc):
-                        raise
-
-            await sess.run("MERGE (:Migration {v: -1})")
-            rec = await sess.run("MATCH (m:Migration) RETURN max(m.v) AS v")
-            latest = (await rec.single())["v"] or -1
-
-            for v, mig in enumerate(self.MIGRATIONS):
-                if v <= latest:
-                    continue
-                await run_safe(mig)
-                await sess.run("CREATE (:Migration {v:$v})", v=v)
-
-    # ─────────────────────────────────────────────────────────────────── #
-    # Internal cursor helper
-    # ─────────────────────────────────────────────────────────────────── #
-    @asynccontextmanager
-    async def _cursor(self) -> AsyncIterator[AsyncSession]:
-        async with self.lock, _ainternal.get_connection(self.conn) as sess:
-            async with sess.begin_transaction() as tx:  # type: ignore[attr-defined]
-                yield tx
-
-    # ─────────────────────────────────────────────────────────────────── #
-    # Public API – checkpoint persistence
-    # ─────────────────────────────────────────────────────────────────── #
-    async def aput(
-        self,
-        config: RunnableConfig,
-        checkpoint: Checkpoint,
-        metadata: CheckpointMetadata,
-        new_versions: ChannelVersions,
-    ) -> RunnableConfig:
-        thread_id = config["configurable"]["thread_id"]
-        checkpoint_ns = config["configurable"].get("checkpoint_ns", "")
-        parent_id = config["configurable"].get("checkpoint_id")
-
-        blobs = self._dump_blobs(
-            thread_id, checkpoint_ns, checkpoint.pop("channel_values"), new_versions
-        )
-
-        async with self._cursor() as tx:
-            await tx.run(
-                """
-                MERGE (c:Checkpoint {
-                    thread_id:$tid,
-                    checkpoint_ns:$ns,
-                    checkpoint_id:$cid
-                })
-                SET c.checkpoint = $checkpoint,
-                    c.metadata = $metadata,
-                    c.parent_checkpoint_id = $parent_id
-                """,
-                tid=thread_id,
-                ns=checkpoint_ns,
-                cid=checkpoint["id"],
-                checkpoint=checkpoint,
-                metadata=get_checkpoint_metadata(config, metadata),
-                parent_id=parent_id,
-            )
-            for tid, ns, channel, ver, type_tag, blob in blobs:
-                await tx.run(
-                    """
-                    MERGE (b:Blob {
-                        thread_id:$tid, checkpoint_ns:$ns,
-                        channel:$chan, version:$ver
-                    })
-                    ON CREATE SET b.type=$type_tag, b.blob=$blob
-                    MERGE (c:Checkpoint {
-                        thread_id:$tid, checkpoint_ns:$ns, checkpoint_id:$cid
-                    })
-                    MERGE (c)-[:HAS_BLOB]->(b)
-                    """,
-                    tid=tid,
-                    ns=ns,
-                    chan=channel,
-                    ver=ver,
-                    type_tag=type_tag,
-                    blob=blob,
-                    cid=checkpoint["id"],
-                )
-
-        logger.debug(
-            "AsyncMemgraphSaver: saved checkpoint %s for thread %s",
-            checkpoint["id"],
-            thread_id,
-        )
-        return {
-            "configurable": {
-                "thread_id": thread_id,
-                "checkpoint_ns": checkpoint_ns,
-                "checkpoint_id": checkpoint["id"],
-            }
-        }
-
-    # ─────────────────────────────────────────────────────────────────── #
-    # Public API – intermediate writes                                 FIX
-    # ─────────────────────────────────────────────────────────────────── #
-    async def aput_writes(
-        self,
-        config: RunnableConfig,
-        writes: Sequence[tuple[str, Any]],
-        task_id: str,
-        task_path: str = "",
-    ) -> None:
-        if not writes:
-            return
-
-        tid = config["configurable"]["thread_id"]
-        ns = config["configurable"].get("checkpoint_ns", "")
-        cid = self._require_checkpoint_id(config)
-
-        rows = self._dump_writes(tid, ns, cid, task_id, task_path, writes)
-
-        async with self._cursor() as tx:
-            for (
-                tid,
-                ns,
-                cid,
-                t_id,
-                t_path,
-                idx,
-                channel,
-                type_tag,
-                blob,
-            ) in rows:
-                # Single MATCH‑MERGE statement avoids WITH … MATCH (which caused
-                # Memgraph.ExecutionException in certain server versions).
-                await tx.run(
-                    """
-                    MATCH (c:Checkpoint {
-                        thread_id:$tid, checkpoint_ns:$ns, checkpoint_id:$cid
-                    })
-                    MERGE (w:Write {
-                        thread_id:$tid, checkpoint_ns:$ns, checkpoint_id:$cid,
-                        task_id:$task_id, idx:$idx
-                    })
-                    SET w.task_path=$task_path,
-                        w.channel=$channel,
-                        w.type=$type_tag,
-                        w.blob=$blob
-                    MERGE (c)-[:HAS_WRITE]->(w)
-                    """,
-                    tid=tid,
-                    ns=ns,
-                    cid=cid,
-                    task_id=t_id,
-                    idx=idx,
-                    task_path=t_path,
-                    channel=channel,
-                    type_tag=type_tag,
-                    blob=blob,
-                )
-
-        logger.debug(
-            "AsyncMemgraphSaver: stored %d pending writes for checkpoint %s (task %s)",
-            len(writes),
-            cid,
-            task_id,
-        )
-
-    # ─────────────────────────────────────────────────────────────────── #
-    # Retrieval utilities  (unchanged)
-    # ─────────────────────────────────────────────────────────────────── #
-    def _build_tuple(
-        self,
-        chk_node,
-        blobs: list[tuple[str, str, bytes]],
-        writes: list[tuple[str, str, str, bytes]],
-    ) -> CheckpointTuple:
-        ckpt = chk_node["checkpoint"]
-        ckpt["channel_values"] = self._load_blobs(blobs)
-        pend = self._load_writes(writes)
-        return CheckpointTuple(
-            {
-                "configurable": {
-                    "thread_id": chk_node["thread_id"],
-                    "checkpoint_ns": chk_node["checkpoint_ns"],
-                    "checkpoint_id": chk_node["checkpoint_id"],
-                }
-            },
-            ckpt,
-            chk_node["metadata"],
-            (
-                {
-                    "configurable": {
-                        "thread_id": chk_node["thread_id"],
-                        "checkpoint_ns": chk_node["checkpoint_ns"],
-                        "checkpoint_id": chk_node.get("parent_checkpoint_id"),
-                    }
-                }
-                if chk_node.get("parent_checkpoint_id")
-                else None
-            ),
-            pend,
-        )
-
-    async def aget_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
-        where, params = self._search_where(config, None, None)
-        cypher = f"""
-        MATCH (c:Checkpoint) {where}
-        OPTIONAL MATCH (c)-[:HAS_BLOB]->(b:Blob)
-        WITH c, collect([b.channel, b.type, b.blob]) AS blobs
-        OPTIONAL MATCH (c)-[:HAS_WRITE]->(w:Write)
-        WITH c, blobs, collect([w.task_id, w.channel, w.type, w.blob]) AS writes
-        RETURN c AS chk, blobs, writes
-        ORDER BY c.checkpoint_id DESC
-        LIMIT 1
         """
-        async with _ainternal.get_connection(self.conn) as sess:
-            rec = await sess.run(cypher, **params)
-            row = await rec.single()
-            if not row:
-                return None
-            return self._build_tuple(row["chk"], row["blobs"], row["writes"])
+        Set up the checkpoint database asynchronously.
+
+        This method creates the necessary constraints and indexes in Memgraph if they
+        don't already exist and runs any pending database migrations.
+        """
+        async with self.driver.session() as session:
+            try:
+                result = await session.run(
+                    "MATCH (m:Migration) RETURN m.v AS v ORDER BY m.v DESC LIMIT 1"
+                )
+                version_record = await result.single()
+                version = version_record["v"] if version_record else -1
+            except Exception:
+                version = -1
+
+            for v, migration in enumerate(self.MIGRATIONS):
+                if v > version:
+                    if not migration.startswith("//"):
+                        await session.run(migration)
+                    await session.run("MERGE (m:Migration {v: $v})", v=v)
 
     async def alist(
         self,
@@ -311,37 +106,346 @@ class AsyncMemgraphSaver(BaseMemgraphSaver):
         filter: dict[str, Any] | None = None,
         before: RunnableConfig | None = None,
         limit: int | None = None,
-    ):
-        where, params = self._search_where(config, filter, before)
-        cypher = f"""
-        MATCH (c:Checkpoint) {where}
-        OPTIONAL MATCH (c)-[:HAS_BLOB]->(b:Blob)
-        WITH c, collect([b.channel, b.type, b.blob]) AS blobs
-        OPTIONAL MATCH (c)-[:HAS_WRITE]->(w:Write)
-        WITH c, blobs, collect([w.task_id, w.channel, w.type, w.blob]) AS writes
-        RETURN c AS chk, blobs, writes
-        ORDER BY c.checkpoint_id DESC
+    ) -> AsyncIterator[CheckpointTuple]:
         """
+        List checkpoints from the database asynchronously.
+
+        Args:
+            config: Base configuration for filtering checkpoints.
+            filter: Additional filtering criteria for metadata.
+            before: If provided, only checkpoints before the specified one are returned.
+            limit: Maximum number of checkpoints to return.
+
+        Yields:
+            An async iterator of matching checkpoint tuples.
+        """
+        where_clause, params = self._search_where_and_params(config, filter, before)
+        query = self.SELECT_CYPHER.replace(
+            "MATCH (c:Checkpoint)", f"MATCH (c:Checkpoint) {where_clause}"
+        )
+        query += " ORDER BY c.checkpoint_id DESC"
         if limit:
-            cypher += " LIMIT $limit"
-            params["limit"] = limit
+            query += f" LIMIT {limit}"
 
-        async with _ainternal.get_connection(self.conn) as sess:
-            res = await sess.run(cypher, **params)
-            async for row in res:
-                yield self._build_tuple(row["chk"], row["blobs"], row["writes"])
+        async with self._session() as tx:
+            result = await tx.run(query, params)  # type: ignore
+            records = [dict(record) async for record in result]
+            if not records:
+                return
 
-    # ─────────────────────────────────────────────────────────────────── #
-    # Deletion
-    # ─────────────────────────────────────────────────────────────────── #
+            to_migrate = [
+                r
+                for r in records
+                if r["checkpoint"].get("v", 0) < 4 and r["parent_checkpoint_id"]
+            ]
+            if to_migrate:
+                thread_id = records[0]["thread_id"]
+                parent_ids = list({r["parent_checkpoint_id"] for r in to_migrate})
+
+                sends_result = await tx.run(
+                    self.SELECT_PENDING_SENDS_CYPHER,
+                    {
+                        "thread_id": thread_id,
+                        "checkpoint_ids": parent_ids,
+                        "tasks_channel": TASKS,
+                    },
+                )
+                sends_records = [dict(record) async for record in sends_result]
+
+                grouped_by_parent = defaultdict(list)
+                for record in to_migrate:
+                    grouped_by_parent[record["parent_checkpoint_id"]].append(record)
+
+                for sends_record in sends_records:
+                    parent_id = sends_record["checkpoint_id"]
+                    for record in grouped_by_parent[parent_id]:
+                        if record.get("channel_values") is None:
+                            record["channel_values"] = []
+                        self._migrate_pending_sends(
+                            sends_record["sends"],
+                            record["checkpoint"],
+                            record["channel_values"],
+                        )
+
+            for record in records:
+                yield await self._load_checkpoint_tuple(record)
+
+    async def aget_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
+        """
+        Get a checkpoint tuple from the database asynchronously.
+
+        Args:
+            config: The config to use for retrieving the checkpoint.
+
+        Returns:
+            The checkpoint tuple, or None if not found.
+        """
+        where_clause, params = self._search_where_and_params(config, None, None)
+        query = self.SELECT_CYPHER.replace(
+            "MATCH (c:Checkpoint)", f"MATCH (c:Checkpoint) {where_clause}"
+        )
+        if "checkpoint_id" not in config["configurable"]:
+            query += " ORDER BY c.checkpoint_id DESC LIMIT 1"
+
+        async with self._session() as tx:
+            result = await tx.run(query, params)  # type: ignore
+            record = await result.single()
+            if record is None:
+                return None
+
+            record_dict = dict(record)
+            if record_dict["checkpoint"].get("v", 0) < 4 and record_dict["parent_checkpoint_id"]:
+                thread_id = config["configurable"]["thread_id"]
+                sends_result = await tx.run(
+                    self.SELECT_PENDING_SENDS_CYPHER,
+                    {
+                        "thread_id": thread_id,
+                        "checkpoint_ids": [record_dict["parent_checkpoint_id"]],
+                        "tasks_channel": TASKS,
+                    },
+                )
+                sends_record = await sends_result.single()
+                if sends_record:
+                    if record_dict.get("channel_values") is None:
+                        record_dict["channel_values"] = []
+                    self._migrate_pending_sends(
+                        sends_record["sends"],
+                        record_dict["checkpoint"],
+                        record_dict["channel_values"],
+                    )
+
+            return await self._load_checkpoint_tuple(record_dict)
+
+    async def aput(
+        self,
+        config: RunnableConfig,
+        checkpoint: Checkpoint,
+        metadata: CheckpointMetadata,
+        new_versions: ChannelVersions,
+    ) -> RunnableConfig:
+        """
+        Save a checkpoint to the database asynchronously.
+
+        Args:
+            config: The config to associate with the checkpoint.
+            checkpoint: The checkpoint to save.
+            metadata: Additional metadata to save with the checkpoint.
+            new_versions: New channel versions as of this write.
+
+        Returns:
+            The updated runnable config.
+        """
+        thread_id = config["configurable"]["thread_id"]
+        checkpoint_ns = config["configurable"].get("checkpoint_ns", "")
+        parent_checkpoint_id = get_checkpoint_id(config)
+
+        checkpoint_blobs = await asyncio.to_thread(
+            self._dump_blobs,
+            thread_id,
+            checkpoint_ns,
+            checkpoint["channel_values"],
+            new_versions,
+        )
+
+        async with self._session() as tx:
+            if checkpoint_blobs:
+                await tx.run(
+                    self.UPSERT_CHECKPOINT_BLOBS_CYPHER,
+                    blobs=checkpoint_blobs,
+                )
+
+            await tx.run(
+                self.UPSERT_CHECKPOINTS_CYPHER,
+                thread_id=thread_id,
+                checkpoint_ns=checkpoint_ns,
+                checkpoint_id=checkpoint["id"],
+                parent_checkpoint_id=parent_checkpoint_id,
+                checkpoint=checkpoint,
+                metadata=get_checkpoint_metadata(config, metadata),
+            )
+
+        return {
+            "configurable": {
+                "thread_id": thread_id,
+                "checkpoint_ns": checkpoint_ns,
+                "checkpoint_id": checkpoint["id"],
+            }
+        }
+
+    async def aput_writes(
+        self,
+        config: RunnableConfig,
+        writes: Sequence[tuple[str, Any]],
+        task_id: str,
+        task_path: str = "",
+    ) -> None:
+        """
+        Store intermediate writes linked to a checkpoint asynchronously.
+
+        Args:
+            config: Configuration of the related checkpoint.
+            writes: A list of writes to store.
+            task_id: The ID of the task creating the writes.
+            task_path: The path of the task.
+        """
+        checkpoint_writes = await asyncio.to_thread(
+            self._dump_writes,
+            config["configurable"]["thread_id"],
+            config["configurable"].get("checkpoint_ns", ""),
+            config["configurable"]["checkpoint_id"],
+            task_id,
+            task_path,
+            writes,
+        )
+
+        if not checkpoint_writes:
+            return
+
+        upsert_mode = all(w[0] in WRITES_IDX_MAP for w in writes)
+        query_template = (
+            self.UPSERT_CHECKPOINT_WRITES_CYPHER
+            if upsert_mode
+            else self.INSERT_CHECKPOINT_WRITES_CYPHER
+        )
+
+        async with self._session() as tx:
+            # FIX: Pass the entire list as the 'writes' parameter
+            await tx.run(query_template, writes=checkpoint_writes)
+
     async def adelete_thread(self, thread_id: str) -> None:
-        async with self._cursor() as tx:
+        """
+        Delete all data associated with a specific thread ID asynchronously.
+
+        Args:
+            thread_id: The ID of the thread to delete.
+        """
+        async with self._session() as tx:
             await tx.run(
                 """
-                MATCH (n)
-                WHERE (n:Checkpoint OR n:Blob OR n:Write) AND n.thread_id = $tid
-                DETACH DELETE n
+                MATCH (c:Checkpoint {thread_id: $thread_id})
+                OPTIONAL MATCH (c)-[:HAS_WRITE]->(w:Write)
+                OPTIONAL MATCH (b:Blob {thread_id: $thread_id})
+                DETACH DELETE c, w, b
                 """,
-                tid=str(thread_id),
+                thread_id=thread_id,
             )
-        logger.info("AsyncMemgraphSaver: deleted all data for thread %s", thread_id)
+
+    @asynccontextmanager
+    async def _session(self) -> AsyncIterator[AsyncTransaction]:
+        """A context manager for acquiring a Neo4j async session and transaction."""
+        async with self.lock:
+            session = self.driver.session()
+            try:
+                tx = await session.begin_transaction()
+                async with tx:
+                    yield tx
+            finally:
+                await session.close()
+
+
+    async def _load_checkpoint_tuple(self, record: Dict[str, Any]) -> CheckpointTuple:
+        """
+        Convert a database record into a CheckpointTuple asynchronously.
+
+        Args:
+            record: A dictionary-like object representing a database row.
+
+        Returns:
+            A structured CheckpointTuple.
+        """
+        channel_values, pending_writes = await asyncio.gather(
+            asyncio.to_thread(self._load_blobs, record.get("channel_values")),
+            asyncio.to_thread(self._load_writes, record.get("pending_writes")),
+        )
+        return CheckpointTuple(
+            {
+                "configurable": {
+                    "thread_id": record["thread_id"],
+                    "checkpoint_ns": record["checkpoint_ns"],
+                    "checkpoint_id": record["checkpoint_id"],
+                }
+            },
+            {
+                **record["checkpoint"],
+                "channel_values": channel_values,
+            },
+            record["metadata"],
+            (
+                {
+                    "configurable": {
+                        "thread_id": record["thread_id"],
+                        "checkpoint_ns": record["checkpoint_ns"],
+                        "checkpoint_id": record["parent_checkpoint_id"],
+                    }
+                }
+                if record["parent_checkpoint_id"]
+                else None
+            ),
+            pending_writes,
+        )
+
+    # Sync methods for background thread execution
+
+    def list(
+        self,
+        config: RunnableConfig | None,
+        *,
+        filter: dict[str, Any] | None = None,
+        before: RunnableConfig | None = None,
+        limit: int | None = None,
+    ) -> Iterator[CheckpointTuple]:
+        if asyncio.get_running_loop() is self.loop:
+            raise asyncio.InvalidStateError(
+                "Sync `list` can't be called from the same event loop. Use `alist`."
+            )
+        aiter_ = self.alist(config, filter=filter, before=before, limit=limit)
+        while True:
+            try:
+                yield asyncio.run_coroutine_threadsafe(
+                    anext(aiter_), self.loop
+                ).result()
+            except StopAsyncIteration:
+                break
+
+    def get_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
+        if asyncio.get_running_loop() is self.loop:
+            raise asyncio.InvalidStateError(
+                "Sync `get_tuple` can't be called from the same event loop. Use `aget_tuple`."
+            )
+        return asyncio.run_coroutine_threadsafe(
+            self.aget_tuple(config), self.loop
+        ).result()
+
+    def put(
+        self,
+        config: RunnableConfig,
+        checkpoint: Checkpoint,
+        metadata: CheckpointMetadata,
+        new_versions: ChannelVersions,
+    ) -> RunnableConfig:
+        return asyncio.run_coroutine_threadsafe(
+            self.aput(config, checkpoint, metadata, new_versions), self.loop
+        ).result()
+
+    def put_writes(
+        self,
+        config: RunnableConfig,
+        writes: Sequence[tuple[str, Any]],
+        task_id: str,
+        task_path: str = "",
+    ) -> None:
+        return asyncio.run_coroutine_threadsafe(
+            self.aput_writes(config, writes, task_id, task_path), self.loop
+        ).result()
+
+    def delete_thread(self, thread_id: str) -> None:
+        if asyncio.get_running_loop() is self.loop:
+            raise asyncio.InvalidStateError(
+                "Sync `delete_thread` can't be called from the same event loop. Use `adelete_thread`."
+            )
+        return asyncio.run_coroutine_threadsafe(
+            self.adelete_thread(thread_id), self.loop
+        ).result()
+
+
+__all__ = ["AsyncMemgraphSaver"]

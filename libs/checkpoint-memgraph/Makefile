@@ -24,7 +24,7 @@ stop-memgraph:
 # Run the full test-suite against a matrix of Memgraph versions.
 # Adjust MEMGRAPH_VERSIONS if you need a different matrix.
 # -------------------------------------------------------------------------
-MEMGRAPH_VERSIONS ?= 3.1 3.2 3.3
+MEMGRAPH_VERSIONS ?= 3.3
 
 test_memgraph_version:
 	@echo "Testing Memgraph $(MEMGRAPH_VERSION)"

@@ -1,12 +1,12 @@
-# libs/checkpoint-memgraph/langgraph/checkpoint/memgraph/base.py
-"""
-Shared helper routines, Cypher schema migrations, and blob (de)serialization
-utilities for both synchronous and asynchronous Memgraph savers.
-"""
 from __future__ import annotations
 
+import base64
+import json
 import random
-from typing import Any, Mapping, Sequence, cast
+from collections.abc import Sequence
+from typing import Any, Optional, cast
+
+from langchain_core.runnables import RunnableConfig
 
 from langgraph.checkpoint.base import (
     WRITES_IDX_MAP,
@@ -14,55 +14,253 @@ from langgraph.checkpoint.base import (
     ChannelVersions,
     get_checkpoint_id,
 )
-from langgraph.checkpoint.serde.base import SerializerProtocol
+from langgraph.checkpoint.serde.types import TASKS
 
-# --------------------------------------------------------------------------- #
-# NOTE:  The constraint syntax below follows Memgraph ≥ 2.11 requirements.
-# --------------------------------------------------------------------------- #
-MIGRATIONS: Sequence[str] = (
-    "MERGE (:Migration {v: 0})",  # 0 – baseline marker (no‑op)
-    """
-    CREATE CONSTRAINT ON (c:Checkpoint)
-    ASSERT c.thread_id, c.checkpoint_ns, c.checkpoint_id IS UNIQUE
-    """,
-    """
-    CREATE CONSTRAINT ON (b:Blob)
-    ASSERT b.thread_id, b.checkpoint_ns, b.channel, b.version IS UNIQUE
-    """,
-    """
-    CREATE CONSTRAINT ON (w:Write)
-    ASSERT w.thread_id, w.checkpoint_ns, w.checkpoint_id,
-           w.task_id, w.idx IS UNIQUE
-    """,
-)
+# ---------------------------------------------------------------------------
+
+MetadataInput = Optional[dict[str, Any]]
+
+# ---------------------------------------------------------------------------
+# Schema‑management & query templates
+# ---------------------------------------------------------------------------
+
+MEMGRAPH_MIGRATIONS = [
+    # v0
+    "CREATE CONSTRAINT ON (m:Migration) ASSERT m.v IS UNIQUE;",
+    # v1‑v3
+    "// No-op for composite constraint on Checkpoint.",
+    "// No-op for composite constraint on Blob.",
+    "// No-op for composite constraint on Write.",
+    # v4
+    "// In Memgraph, properties are nullable by default.",
+    # v5
+    "// No-op migration.",
+    # v6‑v8
+    "CREATE INDEX ON :Checkpoint(thread_id);",
+    "CREATE INDEX ON :Blob(thread_id);",
+    "CREATE INDEX ON :Write(thread_id);",
+    # v9
+    "// The task_path property will be added to Write nodes on creation.",
+]
+
+SELECT_CYPHER = """
+MATCH (c:Checkpoint)
+// Aggregate channel values
+WITH c,
+     [k IN (CASE WHEN c.checkpoint.channel_versions IS NULL
+                 THEN []
+                 ELSE keys(c.checkpoint.channel_versions) END)
+      | {channel: k, version: c.checkpoint.channel_versions[k]}] AS versions
+UNWIND (CASE WHEN size(versions) > 0
+             THEN versions
+             ELSE [{__dummy__: true}] END) AS v_data
+OPTIONAL MATCH (bl:Blob {
+    thread_id: c.thread_id,
+    checkpoint_ns: c.checkpoint_ns,
+    channel: v_data.channel,
+    version: v_data.version
+})
+WITH c,
+     collect(DISTINCT CASE WHEN bl IS NULL
+                           THEN NULL
+                           ELSE [bl.channel, bl.type, bl.blob] END) AS channel_values_raw
+WITH c, [cv IN channel_values_raw WHERE cv IS NOT NULL] AS channel_values
+// Aggregate pending writes
+OPTIONAL MATCH (c)-[:HAS_WRITE]->(cw:Write)
+WITH c, channel_values, cw
+ORDER BY cw.task_id, cw.idx
+WITH c,
+     channel_values,
+     collect(CASE WHEN cw IS NULL
+                  THEN NULL
+                  ELSE [cw.task_id, cw.channel, cw.type, cw.blob] END) AS pending_writes_raw
+RETURN
+    c.thread_id            AS thread_id,
+    c.checkpoint           AS checkpoint,
+    c.checkpoint_ns        AS checkpoint_ns,
+    c.checkpoint_id        AS checkpoint_id,
+    c.parent_checkpoint_id AS parent_checkpoint_id,
+    c.metadata             AS metadata,
+    channel_values,
+    [w IN pending_writes_raw WHERE w IS NOT NULL] AS pending_writes
+"""
+
+SELECT_PENDING_SENDS_CYPHER = """
+MATCH (w:Write)
+WHERE w.thread_id     = $thread_id
+  AND w.checkpoint_id IN $checkpoint_ids
+  AND w.channel       = $tasks_channel
+WITH w.checkpoint_id AS checkpoint_id, w
+ORDER BY w.task_path, w.task_id, w.idx
+RETURN checkpoint_id, collect([w.type, w.blob]) AS sends
+"""
+
+# ---------------------------------------------------------------------------
+#  Templates referenced by saver methods (WITH internal UNWIND!)
+# ---------------------------------------------------------------------------
+
+UPSERT_CHECKPOINT_BLOBS_CYPHER = """
+UNWIND $blobs AS props
+MERGE (b:Blob {
+    thread_id:     props.thread_id,
+    checkpoint_ns: props.checkpoint_ns,
+    channel:       props.channel,
+    version:       props.version
+})
+ON CREATE SET
+    b.type = props.type,
+    b.blob = props.blob
+"""
+
+UPSERT_CHECKPOINTS_CYPHER = """
+MERGE (c:Checkpoint {
+    thread_id:     $thread_id,
+    checkpoint_ns: $checkpoint_ns,
+    checkpoint_id: $checkpoint_id
+})
+ON CREATE SET
+    c.parent_checkpoint_id = $parent_checkpoint_id,
+    c.checkpoint           = $checkpoint,
+    c.metadata             = $metadata
+ON MATCH SET
+    c.checkpoint = $checkpoint,
+    c.metadata   = $metadata
+"""
+
+UPSERT_CHECKPOINT_WRITES_CYPHER = """
+UNWIND $writes AS props
+MERGE (c:Checkpoint {
+    thread_id:     props.thread_id,
+    checkpoint_ns: props.checkpoint_ns,
+    checkpoint_id: props.checkpoint_id
+})
+MERGE (w:Write {
+    thread_id:     props.thread_id,
+    checkpoint_ns: props.checkpoint_ns,
+    checkpoint_id: props.checkpoint_id,
+    task_id:       props.task_id,
+    idx:           props.idx
+})
+ON CREATE SET
+    w.task_path = props.task_path,
+    w.channel   = props.channel,
+    w.type      = props.type,
+    w.blob      = props.blob
+ON MATCH SET
+    w.channel = props.channel,
+    w.type    = props.type,
+    w.blob    = props.blob
+MERGE (c)-[:HAS_WRITE]->(w)
+"""
+
+INSERT_CHECKPOINT_WRITES_CYPHER = """
+UNWIND $writes AS props
+MERGE (c:Checkpoint {
+    thread_id:     props.thread_id,
+    checkpoint_ns: props.checkpoint_ns,
+    checkpoint_id: props.checkpoint_id
+})
+CREATE (w:Write {
+    thread_id:     props.thread_id,
+    checkpoint_ns: props.checkpoint_ns,
+    checkpoint_id: props.checkpoint_id,
+    task_id:       props.task_id,
+    task_path:     props.task_path,
+    idx:           props.idx,
+    channel:       props.channel,
+    type:          props.type,
+    blob:          props.blob
+})
+MERGE (c)-[:HAS_WRITE]->(w)
+"""
+
+# ---------------------------------------------------------------------------
+# Base class
+# ---------------------------------------------------------------------------
 
 
 class BaseMemgraphSaver(BaseCheckpointSaver[str]):
-    """Logic shared by sync & async Memgraph saver implementations."""
+    """Common implementation used by both the sync and async savers."""
 
-    MIGRATIONS: Sequence[str] = MIGRATIONS
+    SELECT_CYPHER = SELECT_CYPHER
+    SELECT_PENDING_SENDS_CYPHER = SELECT_PENDING_SENDS_CYPHER
+    MIGRATIONS = MEMGRAPH_MIGRATIONS
+    UPSERT_CHECKPOINT_BLOBS_CYPHER = UPSERT_CHECKPOINT_BLOBS_CYPHER
+    UPSERT_CHECKPOINTS_CYPHER = UPSERT_CHECKPOINTS_CYPHER
+    UPSERT_CHECKPOINT_WRITES_CYPHER = UPSERT_CHECKPOINT_WRITES_CYPHER
+    INSERT_CHECKPOINT_WRITES_CYPHER = INSERT_CHECKPOINT_WRITES_CYPHER
 
-    # ------------------------------------------------------------------ #
-    # Blob helpers
-    # ------------------------------------------------------------------ #
+    supports_pipeline: bool
+
+    # ---------------------------------------------------------------------
+    #  Internal helpers
+    # ---------------------------------------------------------------------
+
+    # -- blob (de)serialisation helpers -----------------------------------
+
+    @staticmethod
+    def _encode_blob(value: Any) -> Any:
+        """Return a value safe for Memgraph property storage."""
+        if isinstance(value, (bytes, bytearray)):
+            return "b64:" + base64.b64encode(value).decode("ascii")
+        return value
+
+    @staticmethod
+    def _decode_blob(value: Any) -> Any:
+        """Decode value previously encoded by `_encode_blob`."""
+        if isinstance(value, str) and value.startswith("b64:"):
+            try:
+                return base64.b64decode(value[4:])
+            except Exception:
+                # Corrupted? fall through and return original string
+                return value
+        return value
+
+    # -- pending‑send migration ------------------------------------------
+
+    def _migrate_pending_sends(
+        self,
+        pending_sends: list[tuple[str, bytes | str]],
+        checkpoint: dict[str, Any],
+        channel_values: list[tuple[str, str, bytes | str]],
+    ) -> None:
+        """Move legacy pending sends into checkpoint.channel_values."""
+        if not pending_sends:
+            return
+
+        # Decode blobs before deserializing
+        deserialized_sends = [
+            self.serde.loads_typed((type_, self._decode_blob(blob)))
+            for type_, blob in pending_sends
+        ]
+
+        # Re-serialize the entire list of values for the new channel
+        enc, blob = self.serde.dumps_typed(deserialized_sends)
+        blob = self._encode_blob(blob)
+        channel_values.append((TASKS, enc, blob))
+
+        # Assign/bump version for the new channel
+        if "channel_versions" not in checkpoint:
+            checkpoint["channel_versions"] = {}
+        checkpoint["channel_versions"][TASKS] = (
+            max(checkpoint["channel_versions"].values())
+            if checkpoint["channel_versions"]
+            else self.get_next_version(None, None)
+        )
+
+    # -- blob helpers -----------------------------------------------------
+
     def _load_blobs(
         self,
-        blob_records: list[tuple[str, str, bytes]],
+        blob_values: list[tuple[str, str, bytes | str]],
     ) -> dict[str, Any]:
-        """
-        Convert `(channel, type, blob)` triples to decoded Python objects,
-        ignoring any records that are null/empty placeholders.
-        """
-        if not blob_records:
+        """Decode rows from the Blob nodes table."""
+        if not blob_values:
             return {}
-
         return {
-            channel: self.serde.loads_typed((type_tag, blob))
-            for channel, type_tag, blob in blob_records
-            # Skip rows produced by OPTIONAL MATCH where all fields are null
-            if channel
-            and type_tag
-            and type_tag != "empty"
+            channel: self.serde.loads_typed((type_, self._decode_blob(blob)))
+            for channel, type_, blob in blob_values
+            if type_ != "empty"
         }
 
     def _dump_blobs(
@@ -71,33 +269,44 @@ class BaseMemgraphSaver(BaseCheckpointSaver[str]):
         checkpoint_ns: str,
         values: dict[str, Any],
         versions: ChannelVersions,
-    ) -> list[tuple[str, str, str, str, bytes | None]]:
+    ) -> list[dict[str, Any]]:
+        """Prepare blob rows for UNWIND insertion."""
         if not versions:
             return []
-        out: list[tuple[str, str, str, str, bytes | None]] = []
-        for channel, ver in versions.items():
-            if channel in values:
-                type_tag, blob = self.serde.dumps_typed(values[channel])
-            else:
-                type_tag, blob = "empty", None
-            out.append((thread_id, checkpoint_ns, channel, cast(str, ver), type_tag, blob))
-        return out
 
-    # ------------------------------------------------------------------ #
+        blobs: list[dict[str, Any]] = []
+        for channel, version in versions.items():
+            type_, blob = (
+                self.serde.dumps_typed(values[channel]) if channel in values else ("empty", None)
+            )
+            blob = self._encode_blob(blob)
+            blobs.append(
+                {
+                    "thread_id": thread_id,
+                    "checkpoint_ns": checkpoint_ns,
+                    "channel": channel,
+                    "version": cast(str, version),
+                    "type": type_,
+                    "blob": blob,
+                }
+            )
+        return blobs
+
+    # -- write helpers ----------------------------------------------------
+
     def _load_writes(
         self,
-        writes: list[tuple[str, str, str, bytes]],
+        writes: list[tuple[str, str, str, bytes | str]],
     ) -> list[tuple[str, str, Any]]:
-        """Decode pending‑write rows; silently drop null/placeholder rows."""
-        return [
-            (
-                task_id,
-                channel,
-                self.serde.loads_typed((type_tag, blob)),
-            )
-            for task_id, channel, type_tag, blob in writes
-            if channel and type_tag
-        ]
+        """Decode Write node rows."""
+        return (
+            [
+                (task_id, channel, self.serde.loads_typed((type_, self._decode_blob(blob))))
+                for task_id, channel, type_, blob in writes
+            ]
+            if writes
+            else []
+        )
 
     def _dump_writes(
         self,
@@ -107,65 +316,73 @@ class BaseMemgraphSaver(BaseCheckpointSaver[str]):
         task_id: str,
         task_path: str,
         writes: Sequence[tuple[str, Any]],
-    ) -> list[tuple[str, str, str, str, str, int, str, str, bytes]]:
-        return [
-            (
-                thread_id,
-                checkpoint_ns,
-                checkpoint_id,
-                task_id,
-                task_path,
-                WRITES_IDX_MAP.get(channel, idx),
-                channel,
-                *self.serde.dumps_typed(value),
+    ) -> list[dict[str, Any]]:
+        """Prepare Write nodes for batch insertion/upsert."""
+        dumped: list[dict[str, Any]] = []
+        for idx, (channel, value) in enumerate(writes):
+            type_, blob = self.serde.dumps_typed(value)
+            blob = self._encode_blob(blob)
+            dumped.append(
+                {
+                    "thread_id": thread_id,
+                    "checkpoint_ns": checkpoint_ns,
+                    "checkpoint_id": checkpoint_id,
+                    "task_id": task_id,
+                    "task_path": task_path,
+                    "idx": WRITES_IDX_MAP.get(channel, idx),
+                    "channel": channel,
+                    "type": type_,
+                    "blob": blob,
+                }
             )
-            for idx, (channel, value) in enumerate(writes)
-        ]
+        return dumped
 
-    # ------------------------------------------------------------------ #
-    def get_next_version(self, current: str | None) -> str:
+    # -- misc -------------------------------------------------------------
+
+    def get_next_version(self, current: str | None, channel: None) -> str:
+        """Return a monotonically‑increasing version string."""
         if current is None:
-            current_int = 0
+            current_major = 0
+        elif isinstance(current, int):
+            current_major = current
         else:
-            current_int = int(current.split(".")[0])
-        next_int = current_int + 1
-        return f"{next_int:032}.{random.random():016}"
+            current_major = int(current.split(".")[0])
+        next_major = current_major + 1
+        next_rand = random.random()
+        return f"{next_major:032}.{next_rand:016}"
 
-    # ------------------------------------------------------------------ #
-    # Cypher WHERE‑clause helper (unchanged)
-    # ------------------------------------------------------------------ #
-    def _search_where(
+    def _search_where_and_params(
         self,
-        config: Mapping[str, Any] | None,
-        filter: Mapping[str, Any] | None,
-        before: Mapping[str, Any] | None = None,
+        config: RunnableConfig | None,
+        filter: MetadataInput,
+        before: RunnableConfig | None = None,
     ) -> tuple[str, dict[str, Any]]:
+        """Compose Cypher WHERE clause & params from user filters."""
         wheres: list[str] = []
         params: dict[str, Any] = {}
 
         if config:
-            tid = config["configurable"]["thread_id"]
-            wheres.append("c.thread_id = $thread_id")
-            params["thread_id"] = tid
+            if thread_id := config["configurable"].get("thread_id"):
+                wheres.append("c.thread_id = $thread_id")
+                params["thread_id"] = thread_id
 
-            ns = config["configurable"].get("checkpoint_ns", "")
-            wheres.append("c.checkpoint_ns = $checkpoint_ns")
-            params["checkpoint_ns"] = ns
+            if checkpoint_ns := config["configurable"].get("checkpoint_ns"):
+                wheres.append("c.checkpoint_ns = $checkpoint_ns")
+                params["checkpoint_ns"] = checkpoint_ns
 
-            cid = get_checkpoint_id(config)
-            if cid:
+            if checkpoint_id := get_checkpoint_id(config):
                 wheres.append("c.checkpoint_id = $checkpoint_id")
-                params["checkpoint_id"] = cid
-
-        if before is not None:
-            wheres.append("c.checkpoint_id < $before_id")
-            params["before_id"] = get_checkpoint_id(before)
+                params["checkpoint_id"] = checkpoint_id
 
         if filter:
-            for k, v in filter.items():
-                pk = f"meta_{k}"
-                wheres.append(f"c.metadata[{repr(k)}] = ${pk}")
-                params[pk] = v
+            for key, value in filter.items():
+                param_key = f"metadata_{key}"
+                wheres.append(f"c.metadata.{key} = ${param_key}")
+                params[param_key] = value
 
-        where_clause = "WHERE " + " AND ".join(wheres) if wheres else ""
-        return where_clause, params
+        if before is not None:
+            if before_id := get_checkpoint_id(before):
+                wheres.append("c.checkpoint_id < $before_checkpoint_id")
+                params["before_checkpoint_id"] = before_id
+
+        return ("WHERE " + " AND ".join(wheres)) if wheres else "", params

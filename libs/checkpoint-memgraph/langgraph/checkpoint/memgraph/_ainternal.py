@@ -1,4 +1,3 @@
-# langgraph/checkpoint/memgraph/_ainternal.py
 """Async helper utilities for Memgraph checkpoint & store back‑ends."""
 
 from __future__ import annotations
@@ -19,7 +18,7 @@ async def get_connection(conn: Conn) -> AsyncIterator[AsyncSession]:
     if isinstance(conn, AsyncSession):
         yield conn
     elif isinstance(conn, AsyncDriver):
-        async with conn.session() as sess:  # type: ignore[call-arg]
+        async with conn.session() as sess:
             yield sess
-    else:  # pragma: no cover
+    else:
         raise TypeError(f"Invalid Memgraph async connection type: {type(conn)}")
