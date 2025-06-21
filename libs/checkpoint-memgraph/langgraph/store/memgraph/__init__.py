@@ -1,19 +1,23 @@
+# libs/checkpoint-memgraph/langgraph/store/memgraph/__init__.py
+"""
+Synchronous Memgraph key–value store used by LangGraph memory components.
+"""
+
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import threading
-import time
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from datetime import datetime, timedelta, timezone
-from types import TracebackType
+from types import SimpleNamespace, TracebackType
 from typing import (
     Any,
     Dict,
     Iterable,
     List,
     Mapping,
-    MutableMapping,
     Optional,
     Sequence,
     Tuple,
@@ -21,11 +25,11 @@ from typing import (
 )
 
 from neo4j import GraphDatabase, Session, Transaction
+from neo4j.exceptions import ClientError
 
-from langgraph.store.base import (
-    BaseStore,  # type: ignore[attr-defined]
-    Item,  # type: ignore[attr-defined]
-    TTLConfig,  # type: ignore[attr-defined]
+from langgraph.store.base import (  # type: ignore[attr-defined]
+    BaseStore,
+    Item,
 )
 
 from ._utils import parse_bolt_uri
@@ -35,6 +39,9 @@ __all__ = ["MemgraphStore"]
 logger = logging.getLogger(__name__)
 
 
+# --------------------------------------------------------------------------- #
+# Vector‑index helper
+# --------------------------------------------------------------------------- #
 @dataclass(slots=True)
 class _VectorIndexConfig:
     dims: int
@@ -44,9 +51,94 @@ class _VectorIndexConfig:
     embed: Optional[Any] = None  # object with embed_query / embed_documents
 
 
+# --------------------------------------------------------------------------- #
+# Connection mix‑in shared by sync & async stores
+# --------------------------------------------------------------------------- #
 class _MemgraphStoreConnMixin:
+    """
+    Helpers common to both the synchronous and asynchronous Memgraph stores.
+    """
+
     NODE_LABEL: str = "MemoryEntry"
 
+    # ------------------------------------------------------------------ #
+    # Robust Item factory (handles multiple LangGraph versions)
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _build_item(
+        *,
+        namespace: Tuple[str, ...],
+        key: str,
+        value: Any,
+        score: Optional[float] = None,
+        expires_at: Optional[str] = None,
+    ) -> Item:
+        """
+        Build an :class:`~langgraph.store.base.Item` instance while remaining
+        compatible with all LangGraph releases.
+
+        * Detects whether ``Item`` is a dataclass or plain class.
+        * Supplies any *required* keyword‑only parameters with sensible defaults
+          (e.g. ``created_at`` / ``updated_at`` ISO‑timestamps).
+        """
+        # -------------------------------------------------------------- #
+        # discover supported attribute names
+        # -------------------------------------------------------------- #
+        if is_dataclass(Item):
+            item_field_names = {f.name for f in fields(Item)}
+        else:
+            hints = getattr(Item, "__annotations__", {})
+            item_field_names = set(hints) | set(dir(Item))
+
+        kwargs: Dict[str, Any] = {
+            "namespace": namespace,
+            "key": key,
+            "value": value,
+        }
+        if score is not None and "score" in item_field_names:
+            kwargs["score"] = score
+
+        if expires_at is not None:
+            for cand in ("expires_at", "expires", "expiry"):
+                if cand in item_field_names:
+                    kwargs[cand] = expires_at
+                    break
+
+        # -------------------------------------------------------------- #
+        # ensure keyword‑only *required* parameters are provided
+        # -------------------------------------------------------------- #
+        sig = inspect.signature(Item)
+        for name, param in sig.parameters.items():
+            if (
+                param.kind is inspect.Parameter.KEYWORD_ONLY
+                and param.default is inspect.Parameter.empty
+                and name not in kwargs
+            ):
+                # Provide reasonable defaults
+                if name.endswith("_at") or "time" in name:
+                    kwargs[name] = datetime.now(tz=timezone.utc).isoformat()
+                else:
+                    kwargs[name] = None
+
+        # mypy: dynamic construction – ignore strict typing
+        return Item(**kwargs)  # type: ignore[arg-type]
+
+    # ----------------------- helper: tolerant run ----------------------- #
+    @staticmethod
+    def _run_safe(session: Session, cypher: str) -> None:
+        """
+        Execute a DDL statement, swallowing *already‑exists* errors so that the
+        schema setup remains idempotent (Memgraph lacks `IF NOT EXISTS`).
+        """
+        try:
+            session.run(cypher)
+        except ClientError as exc:  # pragma: no cover
+            msg = str(exc).lower()
+            if "already exists" in msg or "existing" in msg or "duplicate" in msg:
+                return
+            raise
+
+    # -------------------- helper: namespace predicate ------------------- #
     @staticmethod
     def _cypher_ns_prefix_filter(prefix: Tuple[str, ...]) -> str:
         base_pred = [
@@ -57,6 +149,7 @@ class _MemgraphStoreConnMixin:
             base_pred.append(f'n.namespace[{idx}] = "{part}"')
         return " AND ".join(base_pred)
 
+    # ------------------- helper: vector‑index statement ----------------- #
     def _vector_index_cypher(self, cfg: _VectorIndexConfig) -> str:
         return (
             f"""
@@ -70,28 +163,30 @@ class _MemgraphStoreConnMixin:
             """
         )
 
+    # ------------------------ schema initialisation --------------------- #
     def _create_schema(self, session: Session, vcfg: _VectorIndexConfig | None) -> None:
-        session.run(
+        # uniqueness on (namespace, key)
+        self._run_safe(
+            session,
             f"""
-            CREATE CONSTRAINT entry_unique IF NOT EXISTS
-            ON (n:{self.NODE_LABEL})
-            ASSERT (n.namespace, n.key) IS UNIQUE
-            """
+            CREATE CONSTRAINT ON (n:{self.NODE_LABEL})
+            ASSERT n.namespace, n.key IS UNIQUE
+            """,
         )
-        session.run(
-            f"""
-            CREATE INDEX entry_expire IF NOT EXISTS
-            FOR (n:{self.NODE_LABEL}) ON (n.expire_at)
-            """
-        )
+        # expiry index
+        self._run_safe(session, f"CREATE INDEX ON :{self.NODE_LABEL}(expire_at)")
+        # optional vector index
         if vcfg:
-            session.run(self._vector_index_cypher(vcfg))
+            self._run_safe(session, self._vector_index_cypher(vcfg))
 
 
-class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):
-    # ------------------------------------------------------------ #
+# =========================================================================== #
+#                              S Y N C   S T O R E                           #
+# =========================================================================== #
+class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):  # type: ignore[misc]
+    # ------------------------------------------------------------------ #
     # construction
-    # ------------------------------------------------------------ #
+    # ------------------------------------------------------------------ #
     def __init__(
         self,
         bolt_uri: str,
@@ -109,6 +204,7 @@ class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):
         if node_label:
             self.NODE_LABEL = str(node_label)
 
+        # optional vector index configuration
         self._vector_cfg: _VectorIndexConfig | None = None
         if index:
             self._vector_cfg = _VectorIndexConfig(
@@ -119,35 +215,55 @@ class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):
                 embed=index.get("embed"),
             )
 
-        self._ttl_cfg: TTLConfig | None = None
+        # TTL configuration wrapped in SimpleNamespace
+        self._ttl_cfg: SimpleNamespace | None = None
         if ttl:
-            self._ttl_cfg = TTLConfig(**ttl)  # type: ignore[arg-type]
-
+            _defaults = {
+                "default_ttl": None,
+                "refresh_on_read": False,
+                "sweep_interval_minutes": None,
+            }
+            _defaults.update(ttl)
+            self._ttl_cfg = SimpleNamespace(**_defaults)
         self._setup_done = False
         self._ttl_thread: threading.Thread | None = None
         self._ttl_stop_evt = threading.Event()
 
-    # ------------- builders ---------------- #
+    # --------------------------- builders -------------------------------- #
     @classmethod
     def from_conn_string(cls, conn: str, **kwargs: Any) -> "MemgraphStore":
         parsed = parse_bolt_uri(conn)
-        return cls(parsed["bolt_uri"], user=parsed["user"], password=parsed["password"], **kwargs)  # type: ignore[arg-type]
+        return cls(
+            parsed["bolt_uri"],
+            user=parsed["user"],
+            password=parsed["password"],
+            **kwargs,
+        )  # type: ignore[arg-type]
 
-    # ------------- context ----------------- #
+    # --------------------------- context -------------------------------- #
     def __enter__(self) -> "MemgraphStore":
         return self
 
+    def __exit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc: Optional[BaseException],
+        tb: Optional[TracebackType],
+    ) -> None:
+        self.close()
+
+    # ------------------------------------------------------------------ #
+    # batch helpers (basic)
+    # ------------------------------------------------------------------ #
     def batch(self, ops: Iterable[Any]) -> list[Any]:
-        """Synchronous batch operation implementation."""
         results = []
         for op in ops:
-            # Basic implementation - you may want to optimize this for true bulk operations
-            if hasattr(op, 'operation') and hasattr(op, 'namespace') and hasattr(op, 'key'):
-                if op.operation == 'get':
+            if hasattr(op, "operation") and hasattr(op, "namespace") and hasattr(op, "key"):
+                if op.operation == "get":
                     result = self.get(op.namespace, op.key)
-                elif op.operation == 'put':
+                elif op.operation == "put":
                     result = self.put(op.namespace, op.key, op.value)
-                elif op.operation == 'delete':
+                elif op.operation == "delete":
                     self.delete(op.namespace, op.key)
                     result = None
                 else:
@@ -158,22 +274,16 @@ class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):
         return results
 
     def abatch(self, ops: Iterable[Any]) -> list[Any]:
-        """Async batch operation implementation (sync wrapper)."""
         import asyncio
+
         return asyncio.run(self._abatch_impl(ops))
-    
+
     async def _abatch_impl(self, ops: Iterable[Any]) -> list[Any]:
-        """Helper for async batch implementation."""
-        return self.batch(ops)  # Delegate to sync version
+        return self.batch(ops)
 
-    def __exit__(
-        self,
-        exc_type: Optional[Type[BaseException]],
-        exc: Optional[BaseException],
-        tb: Optional[TracebackType],
-    ) -> None:
-        self.close()
-
+    # ------------------------------------------------------------------ #
+    # driver lifecycle
+    # ------------------------------------------------------------------ #
     def close(self) -> None:
         if self._ttl_thread and self._ttl_thread.is_alive():
             self._ttl_stop_evt.set()
@@ -192,7 +302,7 @@ class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):
         if self._ttl_cfg and self._ttl_cfg.sweep_interval_minutes:
             self.start_ttl_sweeper()
 
-    initialise = setup
+    initialise = setup  # alias
 
     # ============================================================ #
     # ttl helpers
@@ -208,7 +318,7 @@ class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):
             while not self._ttl_stop_evt.wait(interval):
                 try:
                     self.sweep_ttl()
-                except Exception:
+                except Exception:  # pragma: no cover
                     logger.exception("TTL sweep failed")
 
         self._ttl_thread = threading.Thread(
@@ -229,7 +339,7 @@ class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):
             )
 
     # ============================================================ #
-    # internal utils
+    # internal helpers
     # ============================================================ #
     def _expiry_dt(self, ttl_minutes: float | None) -> Optional[str]:
         if ttl_minutes is None and self._ttl_cfg:
@@ -239,7 +349,7 @@ class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):
         return (datetime.now(tz=timezone.utc) + timedelta(minutes=ttl_minutes)).isoformat()
 
     def _refresh_node_ttl(self, namespace: Tuple[str, ...], key: str) -> None:
-        expire_at = self._expiry_dt(None)
+        exp = self._expiry_dt(None)
         with self._driver.session() as sess:
             sess.run(
                 f"""
@@ -249,11 +359,26 @@ class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):
                 """,
                 ns=list(namespace),
                 key=key,
-                exp=expire_at,
+                exp=exp,
             )
 
     # ============================================================ #
-    # CRUD and helper methods
+    # list distinct namespaces
+    # ============================================================ #
+    def list_namespaces(self, namespace_prefix: Tuple[str, ...]) -> List[Tuple[str, ...]]:
+        pred = self._cypher_ns_prefix_filter(namespace_prefix)
+        with self._driver.session() as sess:
+            res = sess.run(
+                f"""
+                MATCH (n:{self.NODE_LABEL})
+                WHERE {pred}
+                RETURN DISTINCT n.namespace AS ns
+                """
+            )
+            return [tuple(r["ns"]) for r in res]
+
+    # ============================================================ #
+    # CRUD
     # ============================================================ #
     def put(
         self,
@@ -264,7 +389,9 @@ class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):
         index: bool = True,
         ttl: float | None = None,
     ) -> Item:
-        if not (isinstance(namespace, (tuple, list)) and all(isinstance(p, str) for p in namespace)):
+        if not (
+            isinstance(namespace, (tuple, list)) and all(isinstance(p, str) for p in namespace)
+        ):
             raise TypeError("namespace must be tuple[str, ...]")
 
         value_json = json.dumps(value, default=str)
@@ -274,7 +401,7 @@ class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):
             if hasattr(embed_vec, "tolist"):
                 embed_vec = embed_vec.tolist()
 
-        expire_at = self._expiry_dt(ttl)
+        exp = self._expiry_dt(ttl)
 
         with self._driver.session() as sess:
 
@@ -303,13 +430,18 @@ class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):
                     ns=list(namespace),
                     key=key,
                     val=value_json,
-                    exp=expire_at,
+                    exp=exp,
                     embedding=embed_vec,
                 )
 
             sess.execute_write(_tx)
 
-        return Item(namespace=namespace, key=key, value=value, expires_at=expire_at)
+        return self._build_item(
+            namespace=namespace,
+            key=key,
+            value=value,
+            expires_at=exp,
+        )
 
     def put_many(
         self,
@@ -322,6 +454,7 @@ class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):
         for key, value in items:
             self.put(namespace, key, value, index=index, ttl=ttl)
 
+    # ------------------------------------------------------------------ #
     def get(
         self,
         namespace: Tuple[str, ...],
@@ -348,16 +481,20 @@ class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):
         if node.get("expire_at") and node["expire_at"] < datetime.now(tz=timezone.utc):
             self.delete(namespace, key)
             return None
-        if refresh_ttl or (refresh_ttl is None and self._ttl_cfg and self._ttl_cfg.refresh_on_read):
+        if refresh_ttl or (
+            refresh_ttl is None and self._ttl_cfg and self._ttl_cfg.refresh_on_read
+        ):
             self._refresh_node_ttl(namespace, key)
             node["expire_at"] = self._expiry_dt(None)
-        return Item(
+
+        return self._build_item(
             namespace=tuple(node["namespace"]),
             key=node["key"],
             value=json.loads(node["value"]),
             expires_at=node.get("expire_at"),
         )
 
+    # ------------------------------------------------------------------ #
     def exists(self, namespace: Tuple[str, ...], key: str) -> bool:
         with self._driver.session() as sess:
             rec = sess.run(
@@ -372,6 +509,7 @@ class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):
             ).single()
         return rec is not None
 
+    # ------------------------------------------------------------------ #
     def count(self, namespace_prefix: Tuple[str, ...]) -> int:
         predicate = self._cypher_ns_prefix_filter(namespace_prefix)
         with self._driver.session() as sess:
@@ -384,6 +522,7 @@ class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):
             ).single()
         return int(rec["cnt"]) if rec else 0
 
+    # ------------------------------------------------------------------ #
     def list_keys(self, namespace: Tuple[str, ...]) -> List[str]:
         pred = self._cypher_ns_prefix_filter(namespace)
         with self._driver.session() as sess:
@@ -396,6 +535,7 @@ class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):
             )
             return [r["k"] for r in res]
 
+    # ------------------------------------------------------------------ #
     def list_items(self, namespace: Tuple[str, ...]) -> List[Item]:
         pred = self._cypher_ns_prefix_filter(namespace)
         items: List[Item] = []
@@ -410,7 +550,7 @@ class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):
             for rec in res:
                 n = rec["n"]
                 items.append(
-                    Item(
+                    self._build_item(
                         namespace=tuple(n["namespace"]),
                         key=n["key"],
                         value=json.loads(n["value"]),
@@ -419,6 +559,7 @@ class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):
                 )
         return items
 
+    # ------------------------------------------------------------------ #
     def delete(
         self,
         namespace: Tuple[str, ...],
@@ -464,7 +605,9 @@ class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):
                 )
             )
 
-    # search method updated below
+    # ------------------------------------------------------------------ #
+    # SEARCH (vector + lexical)
+    # ------------------------------------------------------------------ #
     def search(
         self,
         namespace_prefix: Tuple[str, ...],
@@ -475,10 +618,10 @@ class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):
         offset: int = 0,
         refresh_ttl: bool | None = None,
     ) -> List[Item]:
-        predicate = self._cypher_ns_prefix_filter(namespace_prefix)
+        pred = self._cypher_ns_prefix_filter(namespace_prefix)
         items: List[Item] = []
 
-        # vector branch
+        # ---------- vector branch ----------
         if (
             query is not None
             and self._vector_cfg
@@ -494,11 +637,11 @@ class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):
                 CALL vector_search.search("{self._vector_cfg.name}", $k, $vec)
                 YIELD node, similarity
                 WITH node, similarity
-                WHERE {predicate}
+                WHERE {pred}
             """
             if filter:
                 for fk, fv in filter.items():
-                    cypher += f" AND node.{fk} = ${fk}"
+                    cypher += f" AND node.{fk} = ${fk} "
                     params[fk] = fv
             cypher += """
                 RETURN node, similarity
@@ -517,7 +660,7 @@ class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):
                     ):
                         self._refresh_node_ttl(tuple(n["namespace"]), n["key"])
                     items.append(
-                        Item(
+                        self._build_item(
                             namespace=tuple(n["namespace"]),
                             key=n["key"],
                             value=json.loads(n["value"]),
@@ -527,11 +670,11 @@ class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):
                     )
             return items
 
-        # lexical branch
+        # ---------- lexical branch ----------
         params: Dict[str, Any] = {"limit": limit, "offset": offset}
         cypher = f"""
             MATCH (n:{self.NODE_LABEL})
-            WHERE {predicate}
+            WHERE {pred}
         """
         if query:
             cypher += " AND n.value CONTAINS $query "
@@ -556,7 +699,7 @@ class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):
                 ):
                     self._refresh_node_ttl(tuple(n["namespace"]), n["key"])
                 items.append(
-                    Item(
+                    self._build_item(
                         namespace=tuple(n["namespace"]),
                         key=n["key"],
                         value=json.loads(n["value"]),

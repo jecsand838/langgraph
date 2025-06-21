@@ -7,7 +7,7 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
-from typing import Iterable, Tuple
+from typing import Iterable, Tuple, Any, AsyncGenerator
 
 import pytest
 
@@ -42,7 +42,7 @@ def event_loop() -> Iterable[asyncio.AbstractEventLoop]:  # pytest‑asyncio def
 
 
 @pytest.fixture(scope="module")
-async def astore() -> Iterable[AsyncMemgraphStore]:
+async def astore() -> AsyncGenerator[AsyncMemgraphStore, None]:
     st = AsyncMemgraphStore.from_conn_string(BOLT_URI)
     await st.setup()
     yield st
@@ -50,7 +50,7 @@ async def astore() -> Iterable[AsyncMemgraphStore]:
 
 
 def _ns() -> Tuple[str, ...]:
-    return ("async-tests", str(uuid.uuid4()))
+    return "async-tests", str(uuid.uuid4())
 
 
 # --------------------------------------------------------------------------- #

@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from typing import Any, Iterator, Sequence
 
 from neo4j import Driver, GraphDatabase, Transaction
+from neo4j.exceptions import ClientError  # ← NEW
 
 from langchain_core.runnables import RunnableConfig
 
@@ -21,6 +22,14 @@ from langgraph.checkpoint.base import (
 from langgraph.checkpoint.memgraph import _internal
 from langgraph.store.memgraph._utils import parse_bolt_uri  # reuse common helper
 from langgraph.checkpoint.memgraph.base import BaseMemgraphSaver
+
+
+# --------------------------------------------------------------------------- #
+# helper: detect duplicate‑schema errors so we can ignore them for idempotency
+# --------------------------------------------------------------------------- #
+def _is_dup_ddl(exc: ClientError) -> bool:  # pragma: no cover
+    msg = str(exc).lower()
+    return "already exists" in msg or "duplicate" in msg or "existing" in msg
 
 
 class MemgraphSaver(BaseMemgraphSaver):
@@ -67,17 +76,30 @@ class MemgraphSaver(BaseMemgraphSaver):
     # Schema initialisation
     # ------------------------------------------------------------------ #
     def setup(self) -> None:
-        """Run Cypher migrations (idempotent)."""
+        """
+        Apply schema migrations.
+
+        Memgraph forbids constraint/index creation inside an explicit
+        multi‑command transaction, so each statement is executed in its own
+        *implicit* (auto‑commit) transaction via ``session.run``.
+        """
         with _internal.get_connection(self.conn) as sess:
-            with sess.begin_transaction() as tx:  # type: ignore[attr-defined]
-                tx.run("MERGE (:Migration {v: -1})")
-                latest = tx.run(
-                    "MATCH (m:Migration) RETURN max(m.v) AS v"
-                ).single()["v"]
-                for v, mig in enumerate(self.MIGRATIONS):
-                    if v > latest:
-                        tx.run(mig)
-                        tx.run("CREATE (:Migration {v: $v})", v=v)
+            # baseline marker
+            sess.run("MERGE (:Migration {v: -1})")
+            latest = sess.run(
+                "MATCH (m:Migration) RETURN max(m.v) AS v"
+            ).single()["v"]
+            latest = latest if latest is not None else -1
+
+            for v, mig in enumerate(self.MIGRATIONS):
+                if v <= latest:
+                    continue
+                try:
+                    sess.run(mig)
+                except ClientError as exc:  # pragma: no cover
+                    if not _is_dup_ddl(exc):
+                        raise
+                sess.run("CREATE (:Migration {v: $v})", v=v)
 
     # ------------------------------------------------------------------ #
     # Internal cursor helper
@@ -162,7 +184,7 @@ class MemgraphSaver(BaseMemgraphSaver):
         return next_config
 
     # ------------------------------------------------------------------ #
-    # Writes (intermediate channel output)                                #
+    # Writes (intermediate channel output)
     # ------------------------------------------------------------------ #
     def put_writes(
         self,
@@ -221,7 +243,7 @@ class MemgraphSaver(BaseMemgraphSaver):
                 )
 
     # ------------------------------------------------------------------ #
-    # Retrieval helpers                                                  #
+    # Retrieval helpers
     # ------------------------------------------------------------------ #
     def _build_checkpoint_tuple(
         self,

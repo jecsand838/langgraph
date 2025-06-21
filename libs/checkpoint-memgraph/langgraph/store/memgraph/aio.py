@@ -1,19 +1,26 @@
+# libs/checkpoint-memgraph/langgraph/store/memgraph/aio.py
+"""
+Asynchronous Memgraph key–value store used by LangGraph memory components.
+"""
+
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import fields, is_dataclass  # only imported for mix‑in helper
 from datetime import datetime, timedelta, timezone
-from types import TracebackType
+from types import SimpleNamespace, TracebackType
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, Type
 
-from neo4j import AsyncGraphDatabase, AsyncSession
-from langgraph.store.base import (
-    BaseStore,  # type: ignore[attr-defined]
-    Item,  # type: ignore[attr-defined]
-    TTLConfig,  # type: ignore[attr-defined]
+from neo4j import AsyncGraphDatabase
+from neo4j.exceptions import ClientError
+
+from langgraph.store.base import (  # type: ignore[attr-defined]
+    BaseStore,
+    Item,
 )
 
 from . import _VectorIndexConfig, _MemgraphStoreConnMixin
@@ -24,7 +31,20 @@ __all__ = ["AsyncMemgraphStore"]
 logger = logging.getLogger(__name__)
 
 
-class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):
+# --------------------------------------------------------------------------- #
+# helper: detect duplicate‑schema errors so we can ignore them for idempotency
+# --------------------------------------------------------------------------- #
+def _is_duplicate_ddl(exc: ClientError) -> bool:  # pragma: no cover
+    msg = str(exc).lower()
+    return "already exists" in msg or "duplicate" in msg or "existing" in msg
+
+
+# =========================================================================== #
+#                             A S Y N C   S T O R E                          #
+# =========================================================================== #
+class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):  # type: ignore[misc]
+    # ------------------------------------------------------------------ #
+    # construction
     # ------------------------------------------------------------------ #
     def __init__(
         self,
@@ -37,12 +57,39 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):
         node_label: str | None = None,
         driver_kwargs: dict | None = None,
     ) -> None:
+        # -------------------------------------------------------------- #
+        # Align Neo4j driver with the *current* running event‑loop
+        # -------------------------------------------------------------- #
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        else:
+            try:
+                if asyncio.get_event_loop() is not running_loop:
+                    asyncio.set_event_loop(running_loop)
+            except RuntimeError:
+                pass  # policy may forbid
+
         self._driver = AsyncGraphDatabase.driver(
             bolt_uri, auth=(user, password), **(driver_kwargs or {})
         )
+
+        # Patch every known loop container inside the driver so that all
+        # sockets & StreamReaders belong to the same loop used by pytest.
+        if running_loop is not None:
+            try:
+                pool = self._driver._pool  # type: ignore[attr-defined]
+                pool._loop = running_loop
+                if hasattr(pool, "_connector"):
+                    pool._connector._loop = running_loop  # type: ignore[attr-defined]
+            except AttributeError:
+                pass  # driver internals changed – ignore
+
         if node_label:
             self.NODE_LABEL = str(node_label)
 
+        # optional vector‑index configuration
         self._vector_cfg: _VectorIndexConfig | None = None
         if index:
             self._vector_cfg = _VectorIndexConfig(
@@ -53,19 +100,34 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):
                 embed=index.get("embed"),
             )
 
-        self._ttl_cfg: TTLConfig | None = None
+        # TTL configuration wrapped in SimpleNamespace
+        self._ttl_cfg: SimpleNamespace | None = None
         if ttl:
-            self._ttl_cfg = TTLConfig(**ttl)  # type: ignore[arg-type]
-
+            _defaults = {
+                "default_ttl": None,
+                "refresh_on_read": False,
+                "sweep_interval_minutes": None,
+            }
+            _defaults.update(ttl)
+            self._ttl_cfg = SimpleNamespace(**_defaults)
         self._setup_done = False
         self._ttl_task: Optional[asyncio.Task[None]] = None
 
+    # ------------------------------------------------------------------ #
+    # delegate robust Item builder from mix‑in
+    # ------------------------------------------------------------------ #
+    _build_item = _MemgraphStoreConnMixin._build_item  # type: ignore
+
+    # ------------------------------------------------------------------ #
+    # builders
     # ------------------------------------------------------------------ #
     @classmethod
     def from_conn_string(cls, conn: str, **kwargs: Any) -> "AsyncMemgraphStore":
         p = parse_bolt_uri(conn)
         return cls(p["bolt_uri"], user=p["user"], password=p["password"], **kwargs)
 
+    # ------------------------------------------------------------------ #
+    # async context
     # ------------------------------------------------------------------ #
     async def __aenter__(self) -> "AsyncMemgraphStore":
         return self
@@ -78,47 +140,59 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):
     ) -> None:
         await self.close()
 
+    # ------------------------------------------------------------------ #
+    # driver lifecycle
+    # ------------------------------------------------------------------ #
     async def close(self) -> None:
         if self._ttl_task:
             self._ttl_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._ttl_task
-        await self._driver.close()
+        try:
+            await self._driver.close()
+        except RuntimeError as exc:  # pragma: no cover
+            if "event loop is closed" not in str(exc).lower():
+                raise
 
     # ------------------------------------------------------------------ #
+    # schema / setup
+    # ------------------------------------------------------------------ #
     async def setup(self) -> None:
-        """Set up the store."""
+        """Initialise database schema (idempotent)."""
         if self._setup_done:
             return
 
-        async def _setup_tx(tx):
-            # Create base indexes/constraints
-            await tx.run(
-                f"""
-                CREATE CONSTRAINT entry_unique IF NOT EXISTS
-                ON (n:{self.NODE_LABEL})
-                ASSERT (n.namespace, n.key) IS UNIQUE
-                """
-            )
-            await tx.run(
-                f"""
-                CREATE INDEX entry_expire IF NOT EXISTS
-                FOR (n:{self.NODE_LABEL}) ON (n.expire_at)
-                """
-            )
-            # Create vector index if configured
-            if self._vector_cfg:
-                await tx.run(self._vector_index_cypher(self._vector_cfg))
-
         async with self._driver.session() as sess:
-            await sess.execute_write(_setup_tx)
+
+            async def run_safe(cypher: str) -> None:
+                try:
+                    await sess.run(cypher)
+                except ClientError as exc:  # pragma: no cover
+                    if not _is_duplicate_ddl(exc):
+                        raise
+
+            # uniqueness constraint
+            await run_safe(
+                f"""
+                CREATE CONSTRAINT ON (n:{self.NODE_LABEL})
+                ASSERT n.namespace, n.key IS UNIQUE
+                """
+            )
+            # expiry index
+            await run_safe(f"CREATE INDEX ON :{self.NODE_LABEL}(expire_at)")
+            # vector index (optional)
+            if self._vector_cfg:
+                await run_safe(self._vector_index_cypher(self._vector_cfg))
+
         self._setup_done = True
         if self._ttl_cfg and self._ttl_cfg.sweep_interval_minutes:
             self._start_ttl_sweeper()
 
-    initialise = setup
+    initialise = setup  # alias
 
-    # ------------------------------------------------------------------ #
+    # ============================================================ #
+    # TTL SWEEPER
+    # ============================================================ #
     def _start_ttl_sweeper(self) -> None:
         if self._ttl_task:
             return
@@ -130,7 +204,7 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):
                 await asyncio.sleep(interval)
                 try:
                     await self.sweep_ttl()
-                except Exception:
+                except Exception:  # pragma: no cover
                     logger.exception("Async TTL sweep failed")
 
         self._ttl_task = asyncio.create_task(_loop())
@@ -147,7 +221,9 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):
                 )
             )
 
-    # ------------------------------------------------------------------ #
+    # ============================================================ #
+    # internal helpers
+    # ============================================================ #
     def _expiry_dt(self, ttl_minutes: float | None) -> Optional[str]:
         if ttl_minutes is None and self._ttl_cfg:
             ttl_minutes = self._ttl_cfg.default_ttl
@@ -169,7 +245,9 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):
                 exp=exp,
             )
 
-    # ------------------------------------------------------------------ #
+    # ============================================================ #
+    # CRUD: PUT
+    # ============================================================ #
     async def aput(
         self,
         namespace: Tuple[str, ...],
@@ -179,7 +257,9 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):
         index: bool = True,
         ttl: float | None = None,
     ) -> Item:
-        if not (isinstance(namespace, (tuple, list)) and all(isinstance(p, str) for p in namespace)):
+        if not (
+            isinstance(namespace, (tuple, list)) and all(isinstance(p, str) for p in namespace)
+        ):
             raise TypeError("namespace must be tuple[str, ...]")
 
         value_json = json.dumps(value, default=str)
@@ -188,11 +268,12 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):
             embed_vec = self._vector_cfg.embed.embed_documents([value_json])[0]  # type: ignore[attr-defined]
             if hasattr(embed_vec, "tolist"):
                 embed_vec = embed_vec.tolist()
-        expire_at = self._expiry_dt(ttl)
+
+        exp = self._expiry_dt(ttl)
 
         async with self._driver.session() as sess:
 
-            async def _tx(tx) -> None:  # type: ignore[valid-type]
+            async def _tx(tx):  # type: ignore[valid-type]
                 await tx.run(
                     f"""
                     MATCH (n:{self.NODE_LABEL})
@@ -217,13 +298,18 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):
                     ns=list(namespace),
                     key=key,
                     val=value_json,
-                    exp=expire_at,
+                    exp=exp,
                     embedding=embed_vec,
                 )
 
             await sess.execute_write(_tx)
 
-        return Item(namespace=namespace, key=key, value=value, expires_at=expire_at)
+        return self._build_item(
+            namespace=namespace,
+            key=key,
+            value=value,
+            expires_at=exp,
+        )
 
     async def aput_many(
         self,
@@ -236,7 +322,9 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):
         for k, v in items:
             await self.aput(namespace, k, v, index=index, ttl=ttl)
 
-    # ------------------------------------------------------------------ #
+    # ============================================================ #
+    # CRUD: GET / EXISTS / COUNT
+    # ============================================================ #
     async def aget(
         self,
         namespace: Tuple[str, ...],
@@ -266,10 +354,12 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):
         if n.get("expire_at") and n["expire_at"] < datetime.now(tz=timezone.utc):
             await self.adelete(namespace, key)
             return None
-        if refresh_ttl or (refresh_ttl is None and self._ttl_cfg and self._ttl_cfg.refresh_on_read):
+        if refresh_ttl or (
+            refresh_ttl is None and self._ttl_cfg and self._ttl_cfg.refresh_on_read
+        ):
             await self._refresh_node_ttl(namespace, key)
             n["expire_at"] = self._expiry_dt(None)
-        return Item(
+        return self._build_item(
             namespace=tuple(n["namespace"]),
             key=n["key"],
             value=json.loads(n["value"]),
@@ -302,6 +392,9 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):
             row = await rec.single()
         return int(row["cnt"]) if row else 0
 
+    # ============================================================ #
+    # CRUD: LIST KEYS / ITEMS
+    # ============================================================ #
     async def alist_keys(self, namespace: Tuple[str, ...]) -> List[str]:
         pred = self._cypher_ns_prefix_filter(namespace)
         async with self._driver.session() as sess:
@@ -328,7 +421,7 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):
             async for rec in res:
                 n = rec["n"]
                 items.append(
-                    Item(
+                    self._build_item(
                         namespace=tuple(n["namespace"]),
                         key=n["key"],
                         value=json.loads(n["value"]),
@@ -337,6 +430,9 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):
                 )
         return items
 
+    # ============================================================ #
+    # CRUD: DELETE
+    # ============================================================ #
     async def adelete(self, namespace: Tuple[str, ...], key: str) -> None:
         async with self._driver.session() as sess:
             await sess.execute_write(
@@ -364,7 +460,9 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):
                 )
             )
 
-    # ------------------------------------------------------------------ #
+    # ============================================================ #
+    # SEARCH (vector + lexical)
+    # ============================================================ #
     async def asearch(
         self,
         namespace_prefix: Tuple[str, ...],
@@ -378,7 +476,7 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):
         pred = self._cypher_ns_prefix_filter(namespace_prefix)
         items: List[Item] = []
 
-        # vector branch
+        # ---------- vector branch ----------
         if (
             query is not None
             and self._vector_cfg
@@ -417,7 +515,7 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):
                     ):
                         await self._refresh_node_ttl(tuple(n["namespace"]), n["key"])
                     items.append(
-                        Item(
+                        self._build_item(
                             namespace=tuple(n["namespace"]),
                             key=n["key"],
                             value=json.loads(n["value"]),
@@ -427,7 +525,7 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):
                     )
             return items
 
-        # lexical branch
+        # ---------- lexical branch ----------
         params: Dict[str, Any] = {"limit": limit, "offset": offset}
         cypher = f"""
             MATCH (n:{self.NODE_LABEL})
@@ -456,7 +554,7 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):
                 ):
                     await self._refresh_node_ttl(tuple(n["namespace"]), n["key"])
                 items.append(
-                    Item(
+                    self._build_item(
                         namespace=tuple(n["namespace"]),
                         key=n["key"],
                         value=json.loads(n["value"]),
@@ -465,20 +563,18 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):
                 )
         return items
 
-    # Add these methods to the AsyncMemgraphStore class
-
-    # ------------------------------------------------------------------ #
+    # ============================================================ #
+    # batch helper
+    # ============================================================ #
     async def abatch(self, ops: Iterable[Any]) -> list[Any]:
-        """Async batch operation implementation."""
         results = []
         for op in ops:
-            # This is a basic implementation - you may want to optimize for bulk operations
-            if hasattr(op, 'operation') and hasattr(op, 'namespace') and hasattr(op, 'key'):
-                if op.operation == 'get':
+            if hasattr(op, "operation") and hasattr(op, "namespace") and hasattr(op, "key"):
+                if op.operation == "get":
                     result = await self.aget(op.namespace, op.key)
-                elif op.operation == 'put':
+                elif op.operation == "put":
                     result = await self.aput(op.namespace, op.key, op.value)
-                elif op.operation == 'delete':
+                elif op.operation == "delete":
                     await self.adelete(op.namespace, op.key)
                     result = None
                 else:
@@ -489,6 +585,6 @@ class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):
         return results
 
     def batch(self, ops: Iterable[Any]) -> list[Any]:
-        """Sync batch operation implementation (delegates to async)."""
         import asyncio
+
         return asyncio.run(self.abatch(ops))
