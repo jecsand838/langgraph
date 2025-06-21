@@ -1,100 +1,102 @@
-# LangGraph Checkpoint & Store — Memgraph Edition
+# LangGraph Memgraph Checkpoint
 
-Production‑ready **checkpoint** and **long‑term memory store** implementations
-for [LangGraph](https://github.com/langchain-ai/langgraph) that leverage
-[Memgraph](https://memgraph.com/) through the Bolt protocol
-(via the official *neo4j‑python* driver).
+Implementation of a LangGraph CheckpointSaver that uses [Memgraph](https://memgraph.com/).
 
-<p align="center">
-  <a href="https://pypi.org/project/langgraph-checkpoint-memgraph/">
-    <img src="https://img.shields.io/pypi/v/langgraph-checkpoint-memgraph.svg" />
-  </a>
-  <a href="https://github.com/langchain-ai/langgraph/actions/workflows/test.yml">
-    <img src="https://github.com/langchain-ai/langgraph/actions/workflows/test.yml/badge.svg" />
-  </a>
-</p>
+## Dependencies
 
----
+The package pulls in `neo4j>=5.14` automatically. No native drivers or Memgraph-specific wheels are required.
 
-- **Sync & Async** savers (`MemgraphSaver`, `AsyncMemgraphSaver`)
-- **Sync & Async** stores (`MemgraphStore`, `AsyncMemgraphStore`)
-- Vector‑similarity (HNSW) search with *optional* embeddings
-- Hierarchical namespaces (`("users", "42")`, `("docs", "faq")`, …)
-- Built‑in TTL expiry with background sweeper
-- Fully typed (PEP 561) & covered by an extensive test‑suite
+## Setup
 
----
-
-## Installation
+You will need to have a Memgraph instance running. The easiest way to do this is with Docker:
 
 ```bash
-pip install langgraph-checkpoint-memgraph
-````
-
-> **Heads‑up**
-> The package pulls in **`neo4j>=5.14`** automatically.
-> No native drivers or Memgraph‑specific wheels are required.
-
-## Quick Start — Checkpoint Saver
-
-> \[!IMPORTANT]
-> Run `.setup()` **once** per database to create indexes / constraints.
-
-```python title="basic_checkpoint.py"
-from langgraph.checkpoint.memgraph import MemgraphSaver
-
-WRITE_CFG = {"configurable": {"thread_id": "my-thread", "checkpoint_ns": ""}}
-READ_CFG  = {"configurable": {"thread_id": "my-thread"}}
-
-BOLT_URI = "bolt://memgraph_user:secret@localhost:7687"
-
-checkpoint = {
-    "v": 1,
-    "ts": "2024-08-01T12:00:00.000000+00:00",
-    "id": "chk‑1",
-    "channel_values": {"greeting": "hello"},
-    "channel_versions": {"greeting": 1},
-}
-
-with MemgraphSaver.from_conn_string(BOLT_URI) as saver:
-    saver.setup()                       # <‑‑ create schema on first run
-    saver.put(WRITE_CFG, checkpoint, {}, {})  # store checkpoint
-    latest = saver.get_tuple(READ_CFG)        # retrieve latest
-    print(latest.checkpoint["channel_values"]["greeting"])   # -> hello
+docker run -it --rm -p 7687:7687 -p 7444:7444 memgraph/memgraph-mage
 ```
 
-### Async flavour
+The default user/password is `memgraph`/`memgraph`.
 
-```python title="basic_checkpoint_async.py"
+## Usage
+
+> [!IMPORTANT]
+> When using Memgraph checkpointers for the first time, make sure to call the `.setup()` method on them to create the required indexes and constraints.
+
+```python
+from langgraph.checkpoint.memgraph import MemgraphSaver
+
+write_config = {"configurable": {"thread_id": "my-thread-id"}}
+read_config = {"configurable": {"thread_id": "my-thread-id"}}
+
+DB_URI = "bolt://memgraph:memgraph@localhost:7687"
+
+with MemgraphSaver.from_conn_string(DB_URI) as checkpointer:
+    # call .setup() the first time you're using the checkpointer
+    checkpointer.setup()
+
+    checkpoint = {
+        "v": 1,
+        "ts": "2024-08-01T12:00:00.000000+00:00",
+        "id": "some_checkpoint_id",
+        "channel_values": {"messages": ["Hello, world!"]},
+        "channel_versions": {"messages": 1},
+        "versions_seen": {},
+    }
+
+    # store checkpoint
+    checkpointer.put(write_config, checkpoint, {}, {})
+
+    # load checkpoint
+    loaded_checkpoint_tuple = checkpointer.get_tuple(read_config)
+    print(loaded_checkpoint_tuple.checkpoint)
+
+    # list checkpoints
+    checkpoints = list(checkpointer.list(read_config))
+    print(f"Found {len(checkpoints)} checkpoints.")
+```
+
+### Async
+
+```python
 import asyncio
 from langgraph.checkpoint.memgraph.aio import AsyncMemgraphSaver
 
-async def main() -> None:
-    BOLT_URI = "bolt://memgraph_user:secret@localhost:7687"
-    cfg = {"configurable": {"thread_id": "async", "checkpoint_ns": ""}}
+write_config = {"configurable": {"thread_id": "my-async-thread-id"}}
+read_config = {"configurable": {"thread_id": "my-async-thread-id"}}
 
-    async with AsyncMemgraphSaver.from_conn_string(BOLT_URI) as saver:
-        await saver.setup()
+DB_URI = "bolt://memgraph:memgraph@localhost:7687"
+
+async def main():
+    async with AsyncMemgraphSaver.from_conn_string(DB_URI) as checkpointer:
+        # call .setup() the first time you're using the checkpointer
+        await checkpointer.setup()
 
         checkpoint = {
             "v": 1,
-            "ts": "2024‑08‑01T12:00:00Z",
-            "id": "chk‑async‑1",
-            "channel_values": {"foo": "bar"},
-            "channel_versions": {"foo": 1},
+            "ts": "2024-08-01T12:00:00.000000+00:00",
+            "id": "some_async_checkpoint_id",
+            "channel_values": {"messages": ["Hello, async world!"]},
+            "channel_versions": {"messages": 1},
+            "versions_seen": {},
         }
 
-        await saver.aput(cfg, checkpoint, {}, {})
-        latest = await saver.aget_tuple(cfg)
-        print(latest.checkpoint["channel_values"]["foo"])  # -> bar
+        # store checkpoint
+        await checkpointer.aput(write_config, checkpoint, {}, {})
 
-asyncio.run(main())
+        # load checkpoint
+        loaded_checkpoint_tuple = await checkpointer.aget_tuple(read_config)
+        print(loaded_checkpoint_tuple.checkpoint)
+
+        # list checkpoints
+        checkpoints = [c async for c in checkpointer.alist(read_config)]
+        print(f"Found {len(checkpoints)} async checkpoints.")
+
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
-### Advanced: Bring‑your‑own Neo4j driver
+### Advanced: Bring-your-own Neo4j driver
 
-If you need explicit control over the connection (connection pooling, SSL
-settings, …) you can create the driver yourself and pass it in:
+If you need explicit control over the connection (e.g., connection pooling, SSL settings), you can create the driver yourself and pass it in:
 
 ```python
 from neo4j import GraphDatabase
@@ -102,111 +104,15 @@ from langgraph.checkpoint.memgraph import MemgraphSaver
 
 driver = GraphDatabase.driver(
     "bolt://localhost:7687",
-    auth=("memgraph_user", "secret"),
-    max_connection_lifetime=180,        # custom parameter
+    auth=("memgraph", "memgraph"),
+    max_connection_lifetime=180,  # custom parameter
 )
 try:
-    saver = MemgraphSaver(driver)
-    saver.setup()
-    # ...
+    checkpointer = MemgraphSaver(driver)
+    checkpointer.setup()
+    # ... use checkpointer as needed
 finally:
     driver.close()
 ```
 
-*(Async works the same with `AsyncGraphDatabase.driver`.)*
-
----
-
-## Quick Start — Long‑term Memory **Store**
-
-```python title="basic_store.py"
-from langgraph.store.memgraph import MemgraphStore
-
-store = MemgraphStore.from_conn_string(
-    "bolt://memgraph_user:secret@localhost:7687",
-    ttl={                       # enable TTL — 30 mins default
-        "default_ttl": 30,
-        "refresh_on_read": True,
-        "sweep_interval_minutes": 5,    # background sweeper
-    },
-    index={                     # enable HNSW vector search
-        "dims": 768,
-        "metric": "cos",
-        "embed": my_embedding_model,    # any object with embed_*()
-    },
-)
-store.setup()
-
-# --------------------------------------------
-# Plain CRUD
-# --------------------------------------------
-ns = ("users", "42")
-
-store.put(ns, key="profile", value={"bio": "AI enthusiast"})
-profile = store.get(ns, "profile")      # -> Item(...)
-
-# --------------------------------------------
-# Vector / lexical search
-# --------------------------------------------
-hits = store.search(("users",), query="AI", limit=5)
-for h in hits:
-    print(h.namespace, h.key, h.score)
-```
-
-### Async store
-
-```python
-from langgraph.store.memgraph.aio import AsyncMemgraphStore
-
-async with AsyncMemgraphStore.from_conn_string("bolt://user:pass@localhost:7687") as store:
-    await store.setup()
-    await store.aput(("docs",), key="intro", value="Welcome to LangGraph!")
-    results = await store.asearch(("docs",), query="Welcome")
-    print(results[0].value)
-```
-
----
-
-## Running Memgraph locally
-
-Spin up Memgraph in seconds with Docker:
-
-```bash
-docker run -it --rm -p 7687:7687 -e MEMGRAPH="--log-level=ERROR" memgraph/memgraph-platform
-```
-
-The default user/password is `memgraph`/`memgraph` (set your own for prod!).
-
----
-
-## Testing
-
-The repository ships a comprehensive test‑suite that boots Memgraph via Docker
-Compose.  Run all tests against a matrix of Memgraph versions:
-
-```bash
-# Requires Docker & GNU Make
-make test
-```
-
-Watch mode (auto re‑run on change):
-
-```bash
-make test_watch
-```
-
----
-
-## Reference
-
-| Class                    | Description                                                  |
-| ------------------------ | ------------------------------------------------------------ |
-| **`MemgraphSaver`**      | Blocking `CheckpointSaver` using the Neo4j driver            |
-| **`AsyncMemgraphSaver`** | `asyncio` counterpart                                        |
-| **`MemgraphStore`**      | High‑level key/value store with optional vector search & TTL |
-| **`AsyncMemgraphStore`** | Async store                                                  |
-
-> Full API reference is available in the
-> [LangGraph documentation](https://langchain-ai.github.io/langgraph/).
-
----
+The async version works similarly with `AsyncGraphDatabase.driver`.
