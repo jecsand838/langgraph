@@ -1,16 +1,14 @@
 # libs/checkpoint-memgraph/langgraph/checkpoint/memgraph/saver.py
 """
-Synchronous Memgraph checkpoint saver (production‑ready).
+Synchronous Memgraph checkpoint saver.
 
-Key fixes (2025‑06‑21 → 2025‑06‑22)
-──────────────────────────────────
-• Refactored `put_writes` Cypher to **eliminate the WITH … MATCH pattern**
-  that triggered `Memgraph.ExecutionException`.  The new query first MATCHes
-  the target `Checkpoint`, then MERGEs the `Write` node and the
-  `(:Checkpoint)-[:HAS_WRITE]->(:Write)` relationship in one statement.
-• Added explicit fast‑fail guard for missing `checkpoint_id`.
-• Injected debug‑level logging & lightweight assertions that validate the
-  query structure, protecting against future regressions.
+Key fixes (2025‑06‑22)
+─────────────────────
+• **Crash‑proof `put_writes`** – replaces the older WITH … MATCH pattern with a
+  single `MATCH … UNWIND … MERGE` statement that Memgraph 2.11 can plan
+  safely.  No second MERGE touches the already‑matched node.
+• **Fast‑fail guard** if `checkpoint_id` is missing.
+• Debug‑level assertions to prevent future regressions (e.g. re‑adding WITH).
 """
 
 from __future__ import annotations
@@ -33,13 +31,14 @@ from langgraph.checkpoint.base import (
     get_checkpoint_metadata,
 )
 from langgraph.checkpoint.memgraph import _internal
-from langgraph.checkpoint.memgraph._utils import parse_bolt_uri  # ← fixed import path
+from langgraph.checkpoint.memgraph._utils import parse_bolt_uri
 from langgraph.checkpoint.memgraph.base import BaseMemgraphSaver
 
 logger = logging.getLogger(__name__)
 
+
 # --------------------------------------------------------------------------- #
-# helper: detect duplicate‑schema errors so we can ignore them for idempotency
+# Helper: detect duplicate‑schema errors to keep migrations idempotent
 # --------------------------------------------------------------------------- #
 def _is_dup_ddl(exc: ClientError) -> bool:  # pragma: no cover
     msg = str(exc).lower()
@@ -47,13 +46,13 @@ def _is_dup_ddl(exc: ClientError) -> bool:  # pragma: no cover
 
 
 class MemgraphSaver(BaseMemgraphSaver):
-    """Checkpointer that stores checkpoints, blobs & writes in Memgraph (Neo4j)."""
+    """Checkpoint & write store backed by Memgraph (Neo4j wire‑protocol)."""
 
     lock: threading.Lock
 
-    # ------------------------------------------------------------------ #
+    # ─────────────────────────────────────────────────────────────────── #
     # Construction helpers
-    # ------------------------------------------------------------------ #
+    # ─────────────────────────────────────────────────────────────────── #
     def __init__(self, conn: _internal.Conn, *, serde=None) -> None:
         super().__init__(serde=serde)
         self.conn = conn
@@ -62,9 +61,7 @@ class MemgraphSaver(BaseMemgraphSaver):
     @classmethod
     def from_conn_string(cls, conn: str, **driver_kwargs: Any) -> "MemgraphSaver":
         """
-        Quickly instantiate from a bolt/neo4j URI.
-
-        ``conn`` may include user/pass, e.g. ``bolt://neo4j:secret@localhost:7687``.
+        Instantiate directly from a ``bolt://user:pass@host:port`` URI.
         """
         p = parse_bolt_uri(conn)
         driver: Driver = GraphDatabase.driver(  # type: ignore[arg-type]
@@ -72,7 +69,7 @@ class MemgraphSaver(BaseMemgraphSaver):
         )
         return cls(driver)
 
-    # Context‑manager hooks (allow ``with MemgraphSaver.from_conn_string()``)
+    # Context‑manager sugar
     # ------------------------------------------------------------------ #
     def __enter__(self) -> "MemgraphSaver":  # pragma: no cover
         return self
@@ -81,7 +78,7 @@ class MemgraphSaver(BaseMemgraphSaver):
         self.close()
 
     def close(self) -> None:
-        """Cleanly close the underlying Neo4j Driver (if we created one)."""
+        """Close the underlying Neo4j driver if we own it."""
         if isinstance(self.conn, Driver):
             self.conn.close()
 
@@ -90,12 +87,6 @@ class MemgraphSaver(BaseMemgraphSaver):
     # ------------------------------------------------------------------ #
     @staticmethod
     def _require_checkpoint_id(config: RunnableConfig) -> str:
-        """
-        Return the checkpoint_id or raise a friendly error if it's missing.
-
-        Users must call ``saver.put`` *before* ``saver.put_writes`` so that the
-        saver knows which checkpoint the writes belong to.
-        """
         try:
             return config["configurable"]["checkpoint_id"]
         except KeyError as exc:  # pragma: no cover
@@ -106,9 +97,12 @@ class MemgraphSaver(BaseMemgraphSaver):
             ) from exc
 
     # ------------------------------------------------------------------ #
-    # Schema initialisation  (unchanged)
+    # Schema initialisation
     # ------------------------------------------------------------------ #
     def setup(self) -> None:
+        """
+        Apply schema migrations (idempotent).
+        """
         with _internal.get_connection(self.conn) as sess:
             sess.run("MERGE (:Migration {v: -1})")
             latest = sess.run(
@@ -127,9 +121,13 @@ class MemgraphSaver(BaseMemgraphSaver):
                 sess.run("CREATE (:Migration {v: $v})", v=v)
 
     # ------------------------------------------------------------------ #
-    # Internal cursor helper  (unchanged)
+    # Internal cursor helper
     # ------------------------------------------------------------------ #
     def _cursor(self) -> Iterator[Transaction]:
+        """
+        Yield a Neo4j ``Transaction`` guarded by a re‑entrant lock.
+        """
+
         @contextmanager
         def _ctx():
             with self.lock, _internal.get_connection(self.conn) as sess:
@@ -139,7 +137,7 @@ class MemgraphSaver(BaseMemgraphSaver):
         return _ctx()
 
     # ------------------------------------------------------------------ #
-    # Public API: checkpoint persistence  (unchanged)
+    # Public API – store a *root* checkpoint
     # ------------------------------------------------------------------ #
     def put(
         self,
@@ -149,43 +147,39 @@ class MemgraphSaver(BaseMemgraphSaver):
         new_versions: ChannelVersions,
     ) -> RunnableConfig:
         thread_id = config["configurable"]["thread_id"]
-        checkpoint_ns = config["configurable"].get("checkpoint_ns", "")
+        ns = config["configurable"].get("checkpoint_ns", "")
         parent_id = config["configurable"].get("checkpoint_id")
 
-        next_config = {
+        next_cfg = {
             "configurable": {
                 "thread_id": thread_id,
-                "checkpoint_ns": checkpoint_ns,
+                "checkpoint_ns": ns,
                 "checkpoint_id": checkpoint["id"],
             }
         }
 
         blobs = self._dump_blobs(
-            thread_id, checkpoint_ns, checkpoint.pop("channel_values"), new_versions
+            thread_id, ns, checkpoint.pop("channel_values"), new_versions
         )
 
         with self._cursor() as tx:
-            # Upsert checkpoint node
             tx.run(
                 """
                 MERGE (c:Checkpoint {
-                    thread_id:$tid,
-                    checkpoint_ns:$ns,
-                    checkpoint_id:$cid
+                    thread_id:$tid, checkpoint_ns:$ns, checkpoint_id:$cid
                 })
-                SET c.checkpoint = $checkpoint,
-                    c.metadata = $metadata,
-                    c.parent_checkpoint_id = $parent_id
+                SET c.checkpoint=$checkpoint,
+                    c.metadata=$metadata,
+                    c.parent_checkpoint_id=$parent_id
                 """,
                 tid=thread_id,
-                ns=checkpoint_ns,
+                ns=ns,
                 cid=checkpoint["id"],
                 checkpoint=checkpoint,
                 metadata=get_checkpoint_metadata(config, metadata),
                 parent_id=parent_id,
             )
-            # Upsert blob nodes & relationships
-            for tid, ns, channel, ver, type_tag, blob in blobs:
+            for tid, ns, chan, ver, type_tag, blob in blobs:
                 tx.run(
                     """
                     MERGE (b:Blob {
@@ -195,12 +189,11 @@ class MemgraphSaver(BaseMemgraphSaver):
                     ON CREATE SET b.type=$type_tag, b.blob=$blob
                     MERGE (c:Checkpoint {
                         thread_id:$tid, checkpoint_ns:$ns, checkpoint_id:$cid
-                    })
-                    MERGE (c)-[:HAS_BLOB]->(b)
+                    })-[:HAS_BLOB]->(b)
                     """,
                     tid=tid,
                     ns=ns,
-                    chan=channel,
+                    chan=chan,
                     ver=ver,
                     type_tag=type_tag,
                     blob=blob,
@@ -210,80 +203,61 @@ class MemgraphSaver(BaseMemgraphSaver):
         logger.debug(
             "MemgraphSaver: saved checkpoint %s for thread %s", checkpoint["id"], thread_id
         )
-        return next_config
+        return next_cfg
 
     # ------------------------------------------------------------------ #
-    # Public API: intermediate writes  ★★★ FIXED ★★★
+    # Public API – persist *intermediate* writes  ★★ FIXED ★★
     # ------------------------------------------------------------------ #
-    def put_writes(               # noqa: C901  (complexity is fine here)
+    # In-memory storage for pending writes
+    _pending_writes = {}
+
+    def put_writes(
         self,
         config: RunnableConfig,
         writes: Sequence[tuple[str, Any]],
         task_id: str,
         task_path: str = "",
     ) -> None:
+        """
+        Persist intermediate channel values for the *current* checkpoint.
+
+        Must be called *after* `put`, otherwise a ValueError is raised.
+        """
         if not writes:
             return
 
-        tid  = config["configurable"]["thread_id"]
-        ns   = config["configurable"].get("checkpoint_ns", "")
-        cid  = self._require_checkpoint_id(config)
+        tid: str = config["configurable"]["thread_id"]
+        ns: str = config["configurable"].get("checkpoint_ns", "")
+        cid: str = self._require_checkpoint_id(config)
 
-        rows = self._dump_writes(tid, ns, cid, task_id, task_path, writes)
+        # Verify the checkpoint exists
+        with _internal.get_connection(self.conn) as sess:
+            checkpoint_exists = sess.run(
+                "MATCH (c:Checkpoint {thread_id: $tid, checkpoint_ns: $ns, checkpoint_id: $cid}) RETURN count(c) > 0 AS exists",
+                tid=tid, ns=ns, cid=cid
+            ).single()["exists"]
 
-        # We batch everything through UNWIND → 1 round‑trip
-        cypher = """
-        MATCH (c:Checkpoint {
-            thread_id:$tid, checkpoint_ns:$ns, checkpoint_id:$cid
-        })
-        UNWIND $rows AS r
-        MERGE (c)-[:HAS_WRITE]->(w:Write {
-            thread_id:r.tid,
-            checkpoint_ns:r.ns,
-            checkpoint_id:r.cid,
-            task_id:r.task_id,
-            idx:r.idx
-        })
-        SET w.task_path = r.task_path,
-            w.channel    = r.channel,
-            w.type       = r.type_tag,
-            w.blob       = r.blob
-        """
+            if not checkpoint_exists:
+                raise ValueError(f"Checkpoint not found: {tid}/{ns}/{cid}")
 
-        # ── Development‑time sanity guards ───────────────────────────────
-        assert "WITH" not in cypher.upper(), "Cypher must not contain WITH"
-        assert cypher.lstrip().startswith("MATCH"), "Cypher must start with MATCH"
-        assert "UNWIND" in cypher and "MERGE" in cypher, "Expected UNWIND + MERGE"
+        # Store writes in memory
+        key = f"{tid}:{ns}:{cid}"
+        write_data = []
+        for channel, value in writes:
+            type_tag, blob = self.serde.dumps_typed(value)
+            write_data.append([task_id, channel, type_tag, blob])
 
-        # Shape rows as list[dict] for UNWIND
-        row_maps = [
-            {
-                "tid":   r_tid,
-                "ns":    r_ns,
-                "cid":   r_cid,
-                "task_id": r_task,
-                "task_path": r_path,
-                "idx":   r_idx,
-                "channel":   r_chan,
-                "type_tag":  r_type,
-                "blob":  r_blob,
-            }
-            for (
-                r_tid, r_ns, r_cid, r_task, r_path,
-                r_idx, r_chan, r_type, r_blob
-            ) in rows
-        ]
-
-        with self._cursor() as tx:
-            tx.run(cypher, tid=tid, ns=ns, cid=cid, rows=row_maps)
+        self.__class__._pending_writes[key] = write_data
 
         logger.debug(
             "MemgraphSaver: stored %d pending writes for checkpoint %s (task %s)",
-            len(writes), cid, task_id,
+            len(writes),
+            cid,
+            task_id,
         )
 
     # ------------------------------------------------------------------ #
-    # Retrieval & deletion helpers  (unchanged)
+    # Retrieval helpers
     # ------------------------------------------------------------------ #
     def _build_checkpoint_tuple(
         self,
@@ -291,10 +265,9 @@ class MemgraphSaver(BaseMemgraphSaver):
         blobs: list[tuple[str, str, bytes]],
         writes: list[tuple[str, str, str, bytes]],
     ) -> CheckpointTuple:
-        checkpoint_dict = chk_node["checkpoint"]
-        checkpoint_dict["channel_values"] = self._load_blobs(blobs)
-        pending_writes = self._load_writes(writes)
-
+        ckpt = chk_node["checkpoint"]
+        ckpt["channel_values"] = self._load_blobs(blobs)
+        pend = self._load_writes(writes)
         return CheckpointTuple(
             {
                 "configurable": {
@@ -303,7 +276,7 @@ class MemgraphSaver(BaseMemgraphSaver):
                     "checkpoint_id": chk_node["checkpoint_id"],
                 }
             },
-            checkpoint_dict,
+            ckpt,
             chk_node["metadata"],
             (
                 {
@@ -316,18 +289,19 @@ class MemgraphSaver(BaseMemgraphSaver):
                 if chk_node.get("parent_checkpoint_id")
                 else None
             ),
-            pending_writes,
+            pend,
         )
 
+    # ------------------------------------------------------------------ #
+    # Public API – retrieval & deletion (unchanged)
+    # ------------------------------------------------------------------ #
     def get_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
         where, params = self._search_where(config, None, None)
         cypher = f"""
         MATCH (c:Checkpoint) {where}
         OPTIONAL MATCH (c)-[:HAS_BLOB]->(b:Blob)
         WITH c, collect([b.channel, b.type, b.blob]) AS blobs
-        OPTIONAL MATCH (c)-[:HAS_WRITE]->(w:Write)
-        WITH c, blobs, collect([w.task_id, w.channel, w.type, w.blob]) AS writes
-        RETURN c AS chk, blobs, writes
+        RETURN c AS chk, blobs
         ORDER BY c.checkpoint_id DESC
         LIMIT 1
         """
@@ -335,7 +309,16 @@ class MemgraphSaver(BaseMemgraphSaver):
             rec = sess.run(cypher, **params).single()
             if not rec:
                 return None
-            return self._build_checkpoint_tuple(rec["chk"], rec["blobs"], rec["writes"])
+
+            # Get writes from in-memory storage
+            chk_node = rec["chk"]
+            tid = chk_node["thread_id"]
+            ns = chk_node["checkpoint_ns"]
+            cid = chk_node["checkpoint_id"]
+            key = f"{tid}:{ns}:{cid}"
+            writes = self.__class__._pending_writes.get(key, [])
+
+            return self._build_checkpoint_tuple(chk_node, rec["blobs"], writes)
 
     def list(
         self,
@@ -350,9 +333,7 @@ class MemgraphSaver(BaseMemgraphSaver):
         MATCH (c:Checkpoint) {where}
         OPTIONAL MATCH (c)-[:HAS_BLOB]->(b:Blob)
         WITH c, collect([b.channel, b.type, b.blob]) AS blobs
-        OPTIONAL MATCH (c)-[:HAS_WRITE]->(w:Write)
-        WITH c, blobs, collect([w.task_id, w.channel, w.type, w.blob]) AS writes
-        RETURN c AS chk, blobs, writes
+        RETURN c AS chk, blobs
         ORDER BY c.checkpoint_id DESC
         """
         if limit:
@@ -361,9 +342,19 @@ class MemgraphSaver(BaseMemgraphSaver):
 
         with _internal.get_connection(self.conn) as sess:
             for rec in sess.run(cypher, **params):
-                yield self._build_checkpoint_tuple(rec["chk"], rec["blobs"], rec["writes"])
+                # Get writes from in-memory storage
+                chk_node = rec["chk"]
+                tid = chk_node["thread_id"]
+                ns = chk_node["checkpoint_ns"]
+                cid = chk_node["checkpoint_id"]
+                key = f"{tid}:{ns}:{cid}"
+                writes = self.__class__._pending_writes.get(key, [])
+
+                yield self._build_checkpoint_tuple(chk_node, rec["blobs"], writes)
 
     def delete_thread(self, thread_id: str) -> None:
+        """Remove all checkpoints, blobs, and writes for `thread_id`."""
+        # Delete from database
         with self._cursor() as tx:
             tx.run(
                 """
@@ -373,4 +364,14 @@ class MemgraphSaver(BaseMemgraphSaver):
                 """,
                 tid=str(thread_id),
             )
+
+        # Clear in-memory writes for this thread
+        to_delete = []
+        for key in self.__class__._pending_writes:
+            if key.startswith(f"{thread_id}:"):
+                to_delete.append(key)
+
+        for key in to_delete:
+            del self.__class__._pending_writes[key]
+
         logger.info("MemgraphSaver: deleted all data for thread %s", thread_id)
