@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   memgraph:
     image: memgraph/memgraph-mage:3.3
@@ -13,7 +11,6 @@ services:
       - MEMGRAPH_PASSWORD=BiggerPassword1233
 
     healthcheck:
-      # Correct flag is --host, and we silence all output so only exit-status matters
       test: ["CMD-SHELL",
              "echo 'RETURN 1;' | mgconsole --host 127.0.0.1 \
                                           --port 7687 \

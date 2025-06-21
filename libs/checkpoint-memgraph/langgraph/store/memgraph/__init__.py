@@ -74,16 +74,10 @@ class _MemgraphStoreConnMixin:
         expires_at: Optional[str] = None,
     ) -> Item:
         """
-        Build an :class:`~langgraph.store.base.Item` instance while remaining
-        compatible with all LangGraph releases.
-
-        * Detects whether ``Item`` is a dataclass or plain class.
-        * Supplies any *required* keyword‑only parameters with sensible defaults
-          (e.g. ``created_at`` / ``updated_at`` ISO‑timestamps).
+        Build an :class:`langgraph.store.base.Item` that is compatible with all
+        LangGraph releases (the class signature has changed a few times).
         """
-        # -------------------------------------------------------------- #
-        # discover supported attribute names
-        # -------------------------------------------------------------- #
+        # Detect supported/required fields
         if is_dataclass(Item):
             item_field_names = {f.name for f in fields(Item)}
         else:
@@ -104,9 +98,7 @@ class _MemgraphStoreConnMixin:
                     kwargs[cand] = expires_at
                     break
 
-        # -------------------------------------------------------------- #
-        # ensure keyword‑only *required* parameters are provided
-        # -------------------------------------------------------------- #
+        # Provide defaults for *required* keyword‑only params (e.g. created_at)
         sig = inspect.signature(Item)
         for name, param in sig.parameters.items():
             if (
@@ -114,27 +106,23 @@ class _MemgraphStoreConnMixin:
                 and param.default is inspect.Parameter.empty
                 and name not in kwargs
             ):
-                # Provide reasonable defaults
-                if name.endswith("_at") or "time" in name:
-                    kwargs[name] = datetime.now(tz=timezone.utc).isoformat()
-                else:
-                    kwargs[name] = None
+                kwargs[name] = (
+                    datetime.now(tz=timezone.utc).isoformat()
+                    if name.endswith("_at") or "time" in name
+                    else None
+                )
 
-        # mypy: dynamic construction – ignore strict typing
         return Item(**kwargs)  # type: ignore[arg-type]
 
     # ----------------------- helper: tolerant run ----------------------- #
     @staticmethod
     def _run_safe(session: Session, cypher: str) -> None:
-        """
-        Execute a DDL statement, swallowing *already‑exists* errors so that the
-        schema setup remains idempotent (Memgraph lacks `IF NOT EXISTS`).
-        """
+        """Execute Cypher but ignore duplicate‑schema errors (idempotency)."""
         try:
             session.run(cypher)
         except ClientError as exc:  # pragma: no cover
             msg = str(exc).lower()
-            if "already exists" in msg or "existing" in msg or "duplicate" in msg:
+            if any(w in msg for w in ("already exists", "duplicate", "existing")):
                 return
             raise
 
@@ -165,7 +153,6 @@ class _MemgraphStoreConnMixin:
 
     # ------------------------ schema initialisation --------------------- #
     def _create_schema(self, session: Session, vcfg: _VectorIndexConfig | None) -> None:
-        # uniqueness on (namespace, key)
         self._run_safe(
             session,
             f"""
@@ -173,9 +160,7 @@ class _MemgraphStoreConnMixin:
             ASSERT n.namespace, n.key IS UNIQUE
             """,
         )
-        # expiry index
         self._run_safe(session, f"CREATE INDEX ON :{self.NODE_LABEL}(expire_at)")
-        # optional vector index
         if vcfg:
             self._run_safe(session, self._vector_index_cypher(vcfg))
 
@@ -204,7 +189,7 @@ class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):  # type: ignore[misc]
         if node_label:
             self.NODE_LABEL = str(node_label)
 
-        # optional vector index configuration
+        # Optional vector index configuration
         self._vector_cfg: _VectorIndexConfig | None = None
         if index:
             self._vector_cfg = _VectorIndexConfig(
@@ -215,7 +200,7 @@ class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):  # type: ignore[misc]
                 embed=index.get("embed"),
             )
 
-        # TTL configuration wrapped in SimpleNamespace
+        # TTL configuration
         self._ttl_cfg: SimpleNamespace | None = None
         if ttl:
             _defaults = {
@@ -225,6 +210,7 @@ class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):  # type: ignore[misc]
             }
             _defaults.update(ttl)
             self._ttl_cfg = SimpleNamespace(**_defaults)
+
         self._setup_done = False
         self._ttl_thread: threading.Thread | None = None
         self._ttl_stop_evt = threading.Event()
@@ -300,14 +286,14 @@ class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):  # type: ignore[misc]
             self._create_schema(sess, self._vector_cfg)
         self._setup_done = True
         if self._ttl_cfg and self._ttl_cfg.sweep_interval_minutes:
-            self.start_ttl_sweeper()
+            self._start_ttl_sweeper()
 
     initialise = setup  # alias
 
     # ============================================================ #
-    # ttl helpers
+    # TTL SWEEPER
     # ============================================================ #
-    def start_ttl_sweeper(self) -> None:
+    def _start_ttl_sweeper(self) -> None:
         if self._ttl_thread and self._ttl_thread.is_alive():
             return
         if not self._ttl_cfg or not self._ttl_cfg.sweep_interval_minutes:
@@ -363,7 +349,7 @@ class MemgraphStore(_MemgraphStoreConnMixin, BaseStore):  # type: ignore[misc]
             )
 
     # ============================================================ #
-    # list distinct namespaces
+    # new: list distinct namespaces
     # ============================================================ #
     def list_namespaces(self, namespace_prefix: Tuple[str, ...]) -> List[Tuple[str, ...]]:
         pred = self._cypher_ns_prefix_filter(namespace_prefix)
