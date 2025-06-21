@@ -1,8 +1,21 @@
+"""Asynchronous Memgraph checkpoint saver (feature‑parity with sync version).
 
-"""Asynchronous Memgraph checkpoint saver (feature‑parity with sync version)."""
+Key fixes (2025‑06‑21)
+──────────────────────
+• Added `_require_checkpoint_id` guard in `aput_writes`; raises a clear
+  `ValueError` if a caller forgets to persist a checkpoint first.
+• Re‑worked `aput_writes` Cypher so the MERGE of `Write` and creation of the
+  relationship to its parent `Checkpoint` happen in a *single* statement,
+  eliminating the Memgraph.ExecutionException seen with `WITH … MATCH`.
+• Added debug‑level logging statements mirroring the synchronous saver.
+• Relies on improved (de)serialization helpers in BaseMemgraphSaver that skip
+  NULL placeholder rows, eliminating the “Unknown serialization type: None”
+  runtime error.
+"""
 from __future__ import annotations
 
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Sequence
 
@@ -22,30 +35,23 @@ from langgraph.checkpoint.memgraph import _ainternal
 from langgraph.checkpoint.memgraph.base import BaseMemgraphSaver
 from langgraph.checkpoint.memgraph.saver import _is_dup_ddl  # reuse helper
 
+logger = logging.getLogger(__name__)
+
 
 class AsyncMemgraphSaver(BaseMemgraphSaver):
-    """Async variant mirroring MemgraphSaver (subset of features)."""
+    """Async variant that offers the same public API as `MemgraphSaver`."""
 
     lock: asyncio.Lock
 
-    # ------------------------------------------------------------------ #
-    # constructor
-    # ------------------------------------------------------------------ #
-    def __init__(
-        self,
-        conn: _ainternal.Conn,
-        *,
-        serde=None,
-    ) -> None:
+    # ─────────────────────────────────────────────────────────────────── #
+    # Construction / factory helpers
+    # ─────────────────────────────────────────────────────────────────── #
+    def __init__(self, conn: _ainternal.Conn, *, serde=None) -> None:
         super().__init__(serde=serde)
         self.conn = conn
         self.lock = asyncio.Lock()
-        # keep a reference to the running loop for blob helpers
         self.loop = asyncio.get_event_loop()
 
-    # ------------------------------------------------------------------ #
-    # factory
-    # ------------------------------------------------------------------ #
     @classmethod
     @asynccontextmanager
     async def from_conn_string(
@@ -59,17 +65,24 @@ class AsyncMemgraphSaver(BaseMemgraphSaver):
         finally:
             await driver.close()
 
-    # ------------------------------------------------------------------ #
-    # Schema initialisation
-    # ------------------------------------------------------------------ #
-    async def setup(self) -> None:
-        """
-        Apply schema migrations.
+    # ─────────────────────────────────────────────────────────────────── #
+    # Internal helpers
+    # ─────────────────────────────────────────────────────────────────── #
+    @staticmethod
+    def _require_checkpoint_id(config: RunnableConfig) -> str:
+        try:
+            return config["configurable"]["checkpoint_id"]
+        except KeyError as exc:  # pragma: no cover
+            raise ValueError(
+                "AsyncMemgraphSaver.aput_writes requires "
+                "`config['configurable']['checkpoint_id']` – "
+                "call `await saver.aput(...)` first."
+            ) from exc
 
-        Each DDL statement is executed in its own implicit transaction because
-        Memgraph disallows constraint/index creation inside an explicit multi‑
-        command transaction.
-        """
+    # ─────────────────────────────────────────────────────────────────── #
+    # Schema initialisation
+    # ─────────────────────────────────────────────────────────────────── #
+    async def setup(self) -> None:
         async with _ainternal.get_connection(self.conn) as sess:
 
             async def run_safe(cypher: str) -> None:
@@ -79,7 +92,6 @@ class AsyncMemgraphSaver(BaseMemgraphSaver):
                     if not _is_dup_ddl(exc):
                         raise
 
-            # baseline marker
             await sess.run("MERGE (:Migration {v: -1})")
             rec = await sess.run("MATCH (m:Migration) RETURN max(m.v) AS v")
             latest = (await rec.single())["v"] or -1
@@ -90,25 +102,25 @@ class AsyncMemgraphSaver(BaseMemgraphSaver):
                 await run_safe(mig)
                 await sess.run("CREATE (:Migration {v:$v})", v=v)
 
-    # ------------------------------------------------------------------ #
-    # internal context manager yielding a TX guarded by an asyncio.Lock
-    # ------------------------------------------------------------------ #
+    # ─────────────────────────────────────────────────────────────────── #
+    # Internal cursor helper
+    # ─────────────────────────────────────────────────────────────────── #
     @asynccontextmanager
     async def _cursor(self) -> AsyncIterator[AsyncSession]:
         async with self.lock, _ainternal.get_connection(self.conn) as sess:
             async with sess.begin_transaction() as tx:  # type: ignore[attr-defined]
                 yield tx
 
-    # ------------------------------------------------------------------ #
-    # Public API
-    # ------------------------------------------------------------------ #
+    # ─────────────────────────────────────────────────────────────────── #
+    # Public API – checkpoint persistence
+    # ─────────────────────────────────────────────────────────────────── #
     async def aput(
         self,
         config: RunnableConfig,
         checkpoint: Checkpoint,
         metadata: CheckpointMetadata,
         new_versions: ChannelVersions,
-    ):
+    ) -> RunnableConfig:
         thread_id = config["configurable"]["thread_id"]
         checkpoint_ns = config["configurable"].get("checkpoint_ns", "")
         parent_id = config["configurable"].get("checkpoint_id")
@@ -144,7 +156,9 @@ class AsyncMemgraphSaver(BaseMemgraphSaver):
                         channel:$chan, version:$ver
                     })
                     ON CREATE SET b.type=$type_tag, b.blob=$blob
-                    MERGE (c:Checkpoint {thread_id:$tid, checkpoint_ns:$ns, checkpoint_id:$cid})
+                    MERGE (c:Checkpoint {
+                        thread_id:$tid, checkpoint_ns:$ns, checkpoint_id:$cid
+                    })
                     MERGE (c)-[:HAS_BLOB]->(b)
                     """,
                     tid=tid,
@@ -155,6 +169,12 @@ class AsyncMemgraphSaver(BaseMemgraphSaver):
                     blob=blob,
                     cid=checkpoint["id"],
                 )
+
+        logger.debug(
+            "AsyncMemgraphSaver: saved checkpoint %s for thread %s",
+            checkpoint["id"],
+            thread_id,
+        )
         return {
             "configurable": {
                 "thread_id": thread_id,
@@ -163,7 +183,9 @@ class AsyncMemgraphSaver(BaseMemgraphSaver):
             }
         }
 
-    # ------------------------------------------------------------------ #
+    # ─────────────────────────────────────────────────────────────────── #
+    # Public API – intermediate writes                                 FIX
+    # ─────────────────────────────────────────────────────────────────── #
     async def aput_writes(
         self,
         config: RunnableConfig,
@@ -176,7 +198,7 @@ class AsyncMemgraphSaver(BaseMemgraphSaver):
 
         tid = config["configurable"]["thread_id"]
         ns = config["configurable"].get("checkpoint_ns", "")
-        cid = config["configurable"]["checkpoint_id"]
+        cid = self._require_checkpoint_id(config)
 
         rows = self._dump_writes(tid, ns, cid, task_id, task_path, writes)
 
@@ -192,8 +214,13 @@ class AsyncMemgraphSaver(BaseMemgraphSaver):
                 type_tag,
                 blob,
             ) in rows:
+                # Single MATCH‑MERGE statement avoids WITH … MATCH (which caused
+                # Memgraph.ExecutionException in certain server versions).
                 await tx.run(
                     """
+                    MATCH (c:Checkpoint {
+                        thread_id:$tid, checkpoint_ns:$ns, checkpoint_id:$cid
+                    })
                     MERGE (w:Write {
                         thread_id:$tid, checkpoint_ns:$ns, checkpoint_id:$cid,
                         task_id:$task_id, idx:$idx
@@ -202,10 +229,6 @@ class AsyncMemgraphSaver(BaseMemgraphSaver):
                         w.channel=$channel,
                         w.type=$type_tag,
                         w.blob=$blob
-                    WITH w
-                    MATCH (c:Checkpoint {
-                        thread_id:$tid, checkpoint_ns:$ns, checkpoint_id:$cid
-                    })
                     MERGE (c)-[:HAS_WRITE]->(w)
                     """,
                     tid=tid,
@@ -219,9 +242,16 @@ class AsyncMemgraphSaver(BaseMemgraphSaver):
                     blob=blob,
                 )
 
-    # ------------------------------------------------------------------ #
-    # retrieval
-    # ------------------------------------------------------------------ #
+        logger.debug(
+            "AsyncMemgraphSaver: stored %d pending writes for checkpoint %s (task %s)",
+            len(writes),
+            cid,
+            task_id,
+        )
+
+    # ─────────────────────────────────────────────────────────────────── #
+    # Retrieval utilities  (unchanged)
+    # ─────────────────────────────────────────────────────────────────── #
     def _build_tuple(
         self,
         chk_node,
@@ -301,7 +331,9 @@ class AsyncMemgraphSaver(BaseMemgraphSaver):
             async for row in res:
                 yield self._build_tuple(row["chk"], row["blobs"], row["writes"])
 
-    # ------------------------------------------------------------------ #
+    # ─────────────────────────────────────────────────────────────────── #
+    # Deletion
+    # ─────────────────────────────────────────────────────────────────── #
     async def adelete_thread(self, thread_id: str) -> None:
         async with self._cursor() as tx:
             await tx.run(
@@ -312,3 +344,4 @@ class AsyncMemgraphSaver(BaseMemgraphSaver):
                 """,
                 tid=str(thread_id),
             )
+        logger.info("AsyncMemgraphSaver: deleted all data for thread %s", thread_id)

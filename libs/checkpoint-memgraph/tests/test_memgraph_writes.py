@@ -13,17 +13,15 @@ BOLT_URI = os.getenv(
 
 
 def _have_db() -> bool:
-    """Check if the Memgraph database is reachable."""
-    # Print the URI to confirm it's being read correctly from the environment variable
+    """Return True if the Memgraph database is reachable on the configured URI."""
     print(f"Attempting to connect with URI: {BOLT_URI}")
     try:
         saver = MemgraphSaver.from_conn_string(BOLT_URI)
         saver.close()
         print("Connection to Memgraph was successful.")
         return True
-    except Exception as e:
-        # Print the actual exception to diagnose the connection issue
-        print(f"Failed to connect to Memgraph: {e}")
+    except Exception as exc:  # pragma: no cover
+        print(f"Failed to connect to Memgraph: {exc}")
         return False
 
 
@@ -52,22 +50,25 @@ def _base_checkpoint() -> dict:
     }
 
 
+# --------------------------------------------------------------------------- #
 def test_put_writes_and_retrieve(saver: MemgraphSaver) -> None:
+    """Ensure writes are persisted and can be retrieved intact."""
     tid = "thr-" + str(uuid.uuid4())
     cfg = {"configurable": {"thread_id": tid}}
 
-    # store root checkpoint
-    saver.put(cfg, _base_checkpoint(), {}, {})
+    # ── Store root checkpoint and capture the *returned* cfg with checkpoint_id ──
+    cfg = saver.put(cfg, _base_checkpoint(), {}, {})
 
-    # store pending writes
+    # ── Store pending writes linked to that checkpoint ──
     writes = [("out", {"msg": "hello"}), ("log", 123)]
     saver.put_writes(cfg, writes, task_id="task-1", task_path="foo.bar")
 
+    # ── Retrieve and validate ──
     ctuple = saver.get_tuple(cfg)
     assert isinstance(ctuple, CheckpointTuple)
     pending = ctuple.pending_writes
     assert len(pending) == 2
-    # Validate channel names and values
+
     channels = {ch for _, ch, _ in pending}
     assert channels == {"out", "log"}
     values = {ch: val for _, ch, val in pending}
@@ -76,16 +77,19 @@ def test_put_writes_and_retrieve(saver: MemgraphSaver) -> None:
 
 
 def test_delete_thread_removes_data(saver: MemgraphSaver) -> None:
+    """Deleting a thread should remove *all* checkpoints, blobs and writes."""
     tid = "thr-" + str(uuid.uuid4())
     cfg = {"configurable": {"thread_id": tid}}
 
-    saver.put(cfg, _base_checkpoint(), {}, {})
-    # sanity check
+    # Create a checkpoint (returns cfg incl. checkpoint_id)
+    cfg = saver.put(cfg, _base_checkpoint(), {}, {})
+
+    # Sanity check that data exists
     assert saver.get_tuple(cfg) is not None
 
-    # delete everything
+    # Delete everything for the thread
     saver.delete_thread(tid)
 
-    # verify deletion
+    # Verify nothing remains
     assert saver.get_tuple(cfg) is None
     assert list(saver.list(cfg)) == []

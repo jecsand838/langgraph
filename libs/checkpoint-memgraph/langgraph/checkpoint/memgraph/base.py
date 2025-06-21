@@ -6,7 +6,7 @@ utilities for both synchronous and asynchronous Memgraph savers.
 from __future__ import annotations
 
 import random
-from typing import Any, Mapping, Sequence, Tuple, cast
+from typing import Any, Mapping, Sequence, cast
 
 from langgraph.checkpoint.base import (
     WRITES_IDX_MAP,
@@ -18,25 +18,17 @@ from langgraph.checkpoint.serde.base import SerializerProtocol
 
 # --------------------------------------------------------------------------- #
 # NOTE:  The constraint syntax below follows Memgraph ≥ 2.11 requirements.
-#   • No custom names or `IF NOT EXISTS`
-#   • Properties listed directly (no extra parentheses)
-#   • Use `ASSERT … IS UNIQUE` or `ASSERT EXISTS(…)`
-# The same strings work on Neo4j ≥ 5, providing one migration set for both.
 # --------------------------------------------------------------------------- #
 MIGRATIONS: Sequence[str] = (
-    # 0 ─ baseline marker (no‑op)
-    "MERGE (:Migration {v: 0})",
-    # 1 ─ composite uniqueness for checkpoints
+    "MERGE (:Migration {v: 0})",  # 0 – baseline marker (no‑op)
     """
     CREATE CONSTRAINT ON (c:Checkpoint)
     ASSERT c.thread_id, c.checkpoint_ns, c.checkpoint_id IS UNIQUE
     """,
-    # 2 ─ composite uniqueness for blobs
     """
     CREATE CONSTRAINT ON (b:Blob)
     ASSERT b.thread_id, b.checkpoint_ns, b.channel, b.version IS UNIQUE
     """,
-    # 3 ─ composite uniqueness for pending writes
     """
     CREATE CONSTRAINT ON (w:Write)
     ASSERT w.thread_id, w.checkpoint_ns, w.checkpoint_id,
@@ -51,22 +43,26 @@ class BaseMemgraphSaver(BaseCheckpointSaver[str]):
     MIGRATIONS: Sequence[str] = MIGRATIONS
 
     # ------------------------------------------------------------------ #
-    def __init__(self, *, serde: SerializerProtocol | None = None) -> None:
-        super().__init__(serde=serde)
-
-    # ------------------------------------------------------------------ #
-    # Blob helpers (mirror Postgres logic, but JSON bytes live in property)
+    # Blob helpers
     # ------------------------------------------------------------------ #
     def _load_blobs(
-        self, blob_records: list[tuple[str, str, bytes]]
+        self,
+        blob_records: list[tuple[str, str, bytes]],
     ) -> dict[str, Any]:
-        """Convert `(channel, type, blob)` triples to decoded Python objects."""
+        """
+        Convert `(channel, type, blob)` triples to decoded Python objects,
+        ignoring any records that are null/empty placeholders.
+        """
         if not blob_records:
             return {}
+
         return {
             channel: self.serde.loads_typed((type_tag, blob))
             for channel, type_tag, blob in blob_records
-            if type_tag != "empty"
+            # Skip rows produced by OPTIONAL MATCH where all fields are null
+            if channel
+            and type_tag
+            and type_tag != "empty"
         }
 
     def _dump_blobs(
@@ -84,22 +80,15 @@ class BaseMemgraphSaver(BaseCheckpointSaver[str]):
                 type_tag, blob = self.serde.dumps_typed(values[channel])
             else:
                 type_tag, blob = "empty", None
-            out.append(
-                (
-                    thread_id,
-                    checkpoint_ns,
-                    channel,
-                    cast(str, ver),
-                    type_tag,
-                    blob,
-                )
-            )
+            out.append((thread_id, checkpoint_ns, channel, cast(str, ver), type_tag, blob))
         return out
 
     # ------------------------------------------------------------------ #
     def _load_writes(
-        self, writes: list[tuple[str, str, str, bytes]]
+        self,
+        writes: list[tuple[str, str, str, bytes]],
     ) -> list[tuple[str, str, Any]]:
+        """Decode pending‑write rows; silently drop null/placeholder rows."""
         return [
             (
                 task_id,
@@ -107,6 +96,7 @@ class BaseMemgraphSaver(BaseCheckpointSaver[str]):
                 self.serde.loads_typed((type_tag, blob)),
             )
             for task_id, channel, type_tag, blob in writes
+            if channel and type_tag
         ]
 
     def _dump_writes(
@@ -142,7 +132,7 @@ class BaseMemgraphSaver(BaseCheckpointSaver[str]):
         return f"{next_int:032}.{random.random():016}"
 
     # ------------------------------------------------------------------ #
-    # Filtering helpers used by list/alist
+    # Cypher WHERE‑clause helper (unchanged)
     # ------------------------------------------------------------------ #
     def _search_where(
         self,
@@ -150,34 +140,32 @@ class BaseMemgraphSaver(BaseCheckpointSaver[str]):
         filter: Mapping[str, Any] | None,
         before: Mapping[str, Any] | None = None,
     ) -> tuple[str, dict[str, Any]]:
-        """Return a Cypher WHERE clause and param dict mirroring Postgres logic."""
         wheres: list[str] = []
         params: dict[str, Any] = {}
 
         if config:
-            thread_id = config["configurable"]["thread_id"]
+            tid = config["configurable"]["thread_id"]
             wheres.append("c.thread_id = $thread_id")
-            params["thread_id"] = thread_id
+            params["thread_id"] = tid
 
-            checkpoint_ns = config["configurable"].get("checkpoint_ns", "")
+            ns = config["configurable"].get("checkpoint_ns", "")
             wheres.append("c.checkpoint_ns = $checkpoint_ns")
-            params["checkpoint_ns"] = checkpoint_ns
+            params["checkpoint_ns"] = ns
 
-            checkpoint_id = get_checkpoint_id(config)
-            if checkpoint_id:
+            cid = get_checkpoint_id(config)
+            if cid:
                 wheres.append("c.checkpoint_id = $checkpoint_id")
-                params["checkpoint_id"] = checkpoint_id
+                params["checkpoint_id"] = cid
 
         if before is not None:
             wheres.append("c.checkpoint_id < $before_id")
             params["before_id"] = get_checkpoint_id(before)
 
         if filter:
-            # Memgraph lacks JSON containment; we store metadata as map
             for k, v in filter.items():
-                param_key = f"meta_{k}"
-                wheres.append(f"c.metadata[{repr(k)}] = ${param_key}")
-                params[param_key] = v
+                pk = f"meta_{k}"
+                wheres.append(f"c.metadata[{repr(k)}] = ${pk}")
+                params[pk] = v
 
         where_clause = "WHERE " + " AND ".join(wheres) if wheres else ""
         return where_clause, params
