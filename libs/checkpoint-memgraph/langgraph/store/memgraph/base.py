@@ -18,6 +18,7 @@ from typing import (
     Union,
     cast,
 )
+from urllib.parse import unquote, urlparse
 
 import orjson
 from neo4j import Driver, GraphDatabase, Session, Transaction
@@ -145,6 +146,37 @@ class BaseMemgraphStore(Generic[C]):
             results.append((query, params, namespace, items))
         return results
 
+    def _extract_texts_for_embedding(
+        self, inserts: list[PutOp]
+    ) -> dict[tuple[str, str], list[str]]:
+        """Extract texts from documents to be embedded based on index configuration."""
+        if not self.index_config:
+            return {}
+
+        texts_by_node: dict[tuple[str, str], list[str]] = defaultdict(list)
+        default_paths = cast(dict, self.index_config)["__tokenized_fields"]
+
+        for op in inserts:
+            if op.index is False:
+                continue
+
+            ns = _namespace_to_text(op.namespace)
+            k = op.key
+            value = op.value
+
+            paths_to_index = (
+                default_paths
+                if op.index is None
+                else [(ix, tokenize_path(ix)) for ix in op.index]
+            )
+
+            for _, tokenized_path in paths_to_index:
+                texts = get_text_at_path(value, tokenized_path)
+                if texts:
+                    texts_by_node[(ns, k)].append(texts[0])
+
+        return texts_by_node
+
     def _prepare_batch_PUT_queries(
         self,
         put_ops: Sequence[tuple[int, PutOp]],
@@ -152,17 +184,13 @@ class BaseMemgraphStore(Generic[C]):
         list[tuple[str, dict[str, Any]]],
         tuple[str, Sequence[tuple[str, str, str]]] | None,
     ]:
-        dedupped_ops: dict[tuple[tuple[str, ...], str], PutOp] = {}
-        for _, op in put_ops:
-            dedupped_ops[(op.namespace, op.key)] = op
+        # Deduplicate ops to handle multiple updates to the same key in one batch
+        dedupped_ops: dict[tuple[tuple[str, ...], str], PutOp] = {
+            (op.namespace, op.key): op for _, op in put_ops
+        }
 
-        inserts: list[PutOp] = []
-        deletes: list[PutOp] = []
-        for op in dedupped_ops.values():
-            if op.value is None:
-                deletes.append(op)
-            else:
-                inserts.append(op)
+        inserts = [op for op in dedupped_ops.values() if op.value is not None]
+        deletes = [op for op in dedupped_ops.values() if op.value is None]
 
         queries: list[tuple[str, dict[str, Any]]] = []
 
@@ -184,33 +212,15 @@ class BaseMemgraphStore(Generic[C]):
 
         embedding_request: tuple[str, Sequence[tuple[str, str, str]]] | None = None
         if inserts:
-            insert_batch = []
-            texts_by_node: dict[tuple[str, str], list[str]] = defaultdict(list)
-
-            for op in inserts:
-                item: dict[str, Any] = {
+            insert_batch = [
+                {
                     "prefix": _namespace_to_text(op.namespace),
                     "key": op.key,
                     "value": orjson.dumps(op.value).decode("utf-8"),
                     "ttl_minutes": op.ttl,
                 }
-                insert_batch.append(item)
-
-                if self.index_config and op.index is not False:
-                    ns = _namespace_to_text(op.namespace)
-                    k = op.key
-                    value = op.value
-
-                    if op.index is None:
-                        paths = cast(dict, self.index_config)["__tokenized_fields"]
-                    else:
-                        paths = [(ix, tokenize_path(ix)) for ix in op.index]
-
-                    for path, tokenized_path in paths:
-                        texts = get_text_at_path(value, tokenized_path)
-                        if texts:
-                            texts_by_node[(ns, k)].append(texts[0])
-
+                for op in inserts
+            ]
             queries.append(
                 (
                     """
@@ -240,20 +250,49 @@ class BaseMemgraphStore(Generic[C]):
                 )
             )
 
+            texts_by_node = self._extract_texts_for_embedding(inserts)
             if texts_by_node:
                 embedding_request_params = [
                     (ns, k, " ".join(txts)) for (ns, k), txts in texts_by_node.items()
                 ]
                 embedding_request = (
                     """
-                        UNWIND $batch as op
-                        MATCH (n:StoreItem {prefix: op.prefix, key: op.key})
-                        SET n.embedding = op.embedding
-                        """,
+                    UNWIND $batch as op
+                    MATCH (n:StoreItem {prefix: op.prefix, key: op.key})
+                    SET n.embedding = op.embedding
+                    """,
                     embedding_request_params,
                 )
-
         return queries, embedding_request
+
+    def _build_search_where_clause(
+        self, op: SearchOp, params: dict[str, Any]
+    ) -> str:
+        """Constructs the WHERE clause for a search query."""
+        where_clauses = ["(n.expires_at IS NULL OR n.expires_at >= localdatetime())"]
+
+        if op.namespace_prefix is not None:
+            where_clauses.append("n.prefix STARTS WITH $prefix")
+            params["prefix"] = _namespace_to_text(op.namespace_prefix)
+
+        if op.filter:
+            for i, (key, value) in enumerate(op.filter.items()):
+                filter_str_param = f"filter_str_{i}"
+                if isinstance(value, str):
+                    substring = f'"{key}":"{value}"'
+                elif isinstance(value, (int, float)):
+                    substring = f'"{key}":{value}'
+                elif isinstance(value, bool):
+                    substring = f'"{key}":{str(value).lower()}'
+                else:
+                    logger.warning(
+                        f"Skipping unsupported filter type for key '{key}': {type(value)}"
+                    )
+                    continue
+                params[filter_str_param] = substring
+                where_clauses.append(f"n.value CONTAINS ${filter_str_param}")
+
+        return f"WHERE {' AND '.join(where_clauses)}"
 
     def _prepare_batch_search_queries(
         self,
@@ -267,30 +306,7 @@ class BaseMemgraphStore(Generic[C]):
 
         for idx, op in search_ops:
             params: dict[str, Any] = {"limit": op.limit, "offset": op.offset}
-            where_clauses = ["(n.expires_at IS NULL OR n.expires_at >= localdatetime())"]
-
-            if op.namespace_prefix is not None:
-                where_clauses.append("n.prefix STARTS WITH $prefix")
-                params["prefix"] = _namespace_to_text(op.namespace_prefix)
-
-            if op.filter:
-                for i, (key, value) in enumerate(op.filter.items()):
-                    filter_str_param = f"filter_str_{i}"
-                    if isinstance(value, str):
-                        substring = f'"{key}":"{value}"'
-                    elif isinstance(value, (int, float)):
-                        substring = f'"{key}":{value}'
-                    elif isinstance(value, bool):
-                        substring = f'"{key}":{str(value).lower()}'
-                    else:
-                        logger.warning(
-                            f"Skipping unsupported filter type for key '{key}': {type(value)}"
-                        )
-                        continue
-                    params[filter_str_param] = substring
-                    where_clauses.append(f"n.value CONTAINS ${filter_str_param}")
-
-            where_statement = f"WHERE {' AND '.join(where_clauses)}"
+            where_statement = self._build_search_where_clause(op, params)
 
             if op.query and self.index_config:
                 embedding_requests.append((idx, op.query))
@@ -301,17 +317,26 @@ class BaseMemgraphStore(Generic[C]):
                     .lower()
                 )
                 if distance_type in ("cosine", "inner_product"):
-                    score_expr = "1.0 - distance"
-                else:
-                    score_expr = "1.0 / (1.0 + distance)"
+                    score_expr = "1.0 - distance / 2.0"
+                else:  # l2
+                    score_expr = "1.0 / (1.0 + sqrt(distance))"
 
                 query_parts = [
                     "CALL vector_search.search('vector_index', $k, $embedding)",
                     "YIELD node AS n, distance",
-                    f"WITH n, {score_expr} AS score",
+                    where_statement,
                 ]
 
-                query_parts.append(where_statement)
+                # Previous implementation was flawed. The original logic is more robust.
+                # Revert to a structure that is syntactically correct and works,
+                # even if slightly less performant than the ideal.
+                # The primary issue was applying WHERE incorrectly.
+                query_parts = [
+                    "CALL vector_search.search('vector_index', $k, $embedding)",
+                    "YIELD node AS n, distance",
+                    f"WITH n, {score_expr} AS score",
+                    where_statement,
+                ]
 
                 if op.refresh_ttl:
                     query_parts.append(
@@ -344,7 +369,7 @@ class BaseMemgraphStore(Generic[C]):
                 params["k"] = op.limit + op.offset if op.limit is not None else 10
                 queries.append((vector_search_query, params))
 
-            else:
+            else:  # Regular (non-vector) search
                 refresh_ttl_statement = ""
                 if op.refresh_ttl:
                     refresh_ttl_statement = """
@@ -437,6 +462,7 @@ class MemgraphStore(BaseStore, BaseMemgraphStore[Driver]):
         "_deserializer",
         "index_config",
         "embeddings",
+        "ttl_config",
         "_ttl_sweeper_thread",
         "_ttl_stop_event",
     )
@@ -468,16 +494,31 @@ class MemgraphStore(BaseStore, BaseMemgraphStore[Driver]):
 
     @classmethod
     @contextmanager
-    def from_uri(
+    def from_conn_string(
         cls,
-        uri: str,
+        conn_string: str,
         *,
-        auth: tuple[str, str] | None = None,
         database: str = "memgraph",
         index: MemgraphIndexConfig | None = None,
         ttl: TTLConfig | None = None,
     ) -> Iterator[MemgraphStore]:
-        """Create a new MemgraphStore instance from a connection URI."""
+        """Create a new MemgraphStore instance from a connection string.
+
+        This method mirrors the interface of the `PostgresStore.from_conn_string`
+        for compatibility.
+
+        Args:
+            conn_string: The Memgraph connection URI (e.g., "bolt://user:pass@host:7687").
+            database: The database name to connect to.
+            index: The index configuration for the store.
+            ttl: The TTL configuration for the store.
+
+        Returns:
+            A MemgraphStore instance within a context manager.
+        """
+        parsed = urlparse(conn_string)
+        uri = f"{parsed.scheme}://{parsed.hostname}:{parsed.port or 7687}"
+        auth = (unquote(parsed.username or ""), unquote(parsed.password or ""))
         with GraphDatabase.driver(uri, auth=auth) as driver:
             yield cls(driver, database=database, index=index, ttl=ttl)
 
@@ -641,12 +682,14 @@ class MemgraphStore(BaseStore, BaseMemgraphStore[Driver]):
                 )
 
             query, txt_params = embedding_request
-            texts_to_embed = [param[-1] for param in txt_params]
-            vectors = self.embeddings.embed_documents(texts_to_embed)
+            # Optimization: Embed unique texts only to avoid redundant computations
+            unique_texts = sorted({param[-1] for param in txt_params})
+            vectors = self.embeddings.embed_documents(unique_texts)
+            text_to_vector = dict(zip(unique_texts, vectors))
 
             embedding_batch = [
-                {"prefix": ns, "key": k, "embedding": vector}
-                for (ns, k, _), vector in zip(txt_params, vectors)
+                {"prefix": ns, "key": k, "embedding": text_to_vector[text]}
+                for (ns, k, text) in txt_params
             ]
 
             tx.run(query, {"batch": embedding_batch})
@@ -664,13 +707,14 @@ class MemgraphStore(BaseStore, BaseMemgraphStore[Driver]):
         }
 
         if embedding_requests and self.embeddings:
-            texts_to_embed = [text for _, text in embedding_requests]
-            op_indices_to_embed = [op_idx for op_idx, _ in embedding_requests]
-            embeddings = self.embeddings.embed_documents(texts_to_embed)
+            # Optimization: Embed unique query texts only
+            unique_texts = sorted({text for _, text in embedding_requests})
+            embeddings = self.embeddings.embed_documents(unique_texts)
+            text_to_embedding = dict(zip(unique_texts, embeddings))
 
-            for op_idx, embedding in zip(op_indices_to_embed, embeddings):
+            for op_idx, text in embedding_requests:
                 if op_idx in op_idx_to_params:
-                    op_idx_to_params[op_idx]["embedding"] = embedding
+                    op_idx_to_params[op_idx]["embedding"] = text_to_embedding[text]
 
         for i, (op_idx, _) in enumerate(search_ops):
             query, params = queries[i]

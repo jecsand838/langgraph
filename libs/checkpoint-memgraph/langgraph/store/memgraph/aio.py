@@ -1,556 +1,408 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
-import json
 import logging
-from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace, TracebackType
-from typing import (
-    Any,
-    Dict,
-    Iterable,
-    List,
-    Mapping,
-    Optional,
-    Sequence,
-    Tuple,
-    Type,
+from collections.abc import AsyncIterator, Iterable, Sequence
+from contextlib import asynccontextmanager
+from typing import Any, Callable, cast
+
+import orjson
+from neo4j import AsyncDriver, AsyncGraphDatabase, AsyncSession, AsyncTransaction
+from typing_extensions import Self
+
+from langgraph.store.base import (
+    GetOp,
+    ListNamespacesOp,
+    Op,
+    PutOp,
+    Result,
+    SearchOp,
 )
-
-from neo4j import AsyncGraphDatabase
-from neo4j.exceptions import ClientError
-
-from langgraph.store.base import (  # type: ignore[attr-defined]
-    BaseStore,
-    Item,
+from langgraph.store.base.batch import AsyncBatchedBaseStore
+from langgraph.store.memgraph.base import (
+    BaseMemgraphStore,
+    MemgraphIndexConfig,
+    TTLConfig,
+    _decode_ns_text,
+    _ensure_index_config,
+    _group_ops,
+    _record_to_item,
+    _record_to_search_item,
 )
-
-from . import _MemgraphStoreConnMixin, _VectorIndexConfig
-from ._utils import parse_bolt_uri
-
-__all__ = ["AsyncMemgraphStore"]
 
 logger = logging.getLogger(__name__)
 
 
-def _is_duplicate_ddl(exc: ClientError) -> bool:  # pragma: no cover
-    msg = str(exc).lower()
-    return "already exists" in msg or "duplicate" in msg or "existing" in msg
+class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
+    """Asynchronous Memgraph-backed store with optional vector search."""
 
-
-class AsyncMemgraphStore(_MemgraphStoreConnMixin, BaseStore):  # type: ignore[misc]
-    """
-    Asynchronous Memgraph key–value store.
-
-    **Event‑loop safety**
-
-    * A separate Neo4j async driver is kept for **each event‑loop** that
-      touches the store.  This fully eliminates “Future attached to a different
-      loop” errors that occur when the same store instance is shared across
-      multiple loops (e.g. under `pytest‑asyncio`).
-    """
+    __slots__ = (
+        "database",
+        "_deserializer",
+        "index_config",
+        "embeddings",
+        "ttl_config",
+        "_ttl_sweeper_task",
+        "_ttl_stop_event",
+    )
+    supports_ttl: bool = True
 
     def __init__(
         self,
-        bolt_uri: str,
+        conn: AsyncDriver,
         *,
-        user: str = "neo4j",
-        password: str = "neo4j",
-        index: Mapping[str, Any] | None = None,
-        ttl: Mapping[str, Any] | None = None,
-        node_label: str | None = None,
-        driver_kwargs: dict | None = None,
+        database: str = "memgraph",
+        deserializer: Callable[[str], dict[str, Any]] | None = None,
+        index: MemgraphIndexConfig | None = None,
+        ttl: TTLConfig | None = None,
     ) -> None:
-        # Connection details
-        self._bolt_uri = bolt_uri
-        self._user = user
-        self._password = password
-        self._driver_kwargs = driver_kwargs or {}
-        # Neo4j drivers keyed by the owning event‑loop
-        self._drivers: dict[asyncio.AbstractEventLoop, Any] = {}
-        if node_label:
-            self.NODE_LABEL = str(node_label)
-        # Optional vector‑index configuration
-        self._vector_cfg: _VectorIndexConfig | None = None
-        if index:
-            self._vector_cfg = _VectorIndexConfig(
-                dims=index["dims"],
-                metric=index.get("metric", "cos"),
-                name=index.get("name", "memory_embeddings"),
-                capacity=index.get("capacity", 1_000_000),
-                embed=index.get("embed"),
+        """Initialize the AsyncMemgraphStore."""
+        super().__init__()
+        self.conn = conn
+        self.database = database
+        self._deserializer = deserializer or (lambda v: orjson.loads(v))
+        self.index_config = index
+        if self.index_config:
+            self.embeddings, self.index_config = _ensure_index_config(
+                self.index_config
             )
-        # TTL configuration
-        self._ttl_cfg: SimpleNamespace | None = None
-        if ttl:
-            _defaults = {
-                "default_ttl": None,
-                "refresh_on_read": False,
-                "sweep_interval_minutes": None,
-            }
-            _defaults.update(ttl)
-            self._ttl_cfg = SimpleNamespace(**_defaults)
-        self._setup_done = False
-        self._ttl_task: Optional[asyncio.Task[None]] = None
-
-    def _create_driver(self, loop: asyncio.AbstractEventLoop):
-        """Create a Neo4j async driver bound to *loop*."""
-        driver = AsyncGraphDatabase.driver(
-            self._bolt_uri, auth=(self._user, self._password), **self._driver_kwargs
-        )
-        try:
-            pool = driver._pool
-            pool._loop = loop
-            if hasattr(pool, "_connector"):
-                pool._connector._loop = loop
-        except AttributeError:
-            pass
-        return driver
-
-    def _get_driver(self):
-        loop = asyncio.get_running_loop()
-        if loop not in self._drivers:
-            self._drivers[loop] = self._create_driver(loop)
-        return self._drivers[loop]
-
-    @property
-    def _driver(self):
-        return self._get_driver()
+        else:
+            self.embeddings = None
+        self.ttl_config = ttl
+        self._ttl_sweeper_task: asyncio.Task[None] | None = None
+        self._ttl_stop_event = asyncio.Event()
 
     @classmethod
-    def from_conn_string(cls, conn: str, **kwargs: Any) -> "AsyncMemgraphStore":
-        parsed = parse_bolt_uri(conn)
-        return cls(
-            parsed["bolt_uri"], user=parsed["user"], password=parsed["password"], **kwargs
-        )
-
-    async def __aenter__(self) -> "AsyncMemgraphStore":
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: Optional[Type[BaseException]],
-        exc: Optional[BaseException],
-        tb: Optional[TracebackType],
-    ) -> None:
-        await self.close()
-
-    async def close(self) -> None:
-        if self._ttl_task:
-            self._ttl_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._ttl_task
-        for drv in list(self._drivers.values()):
-            try:
-                await drv.close()
-            except RuntimeError as exc:  # pragma: no cover
-                if "event loop is closed" not in str(exc).lower():
-                    raise
-        self._drivers.clear()
-
-    async def setup(self) -> None:
-        """Initialise database schema (idempotent)."""
-        if self._setup_done:
-            return
-
-        async with self._driver.session() as sess:
-            async def run_safe(cypher: str) -> None:
-                try:
-                    result = await sess.run(cypher)
-                    await result.consume()
-                except ClientError as exc:
-                    if not _is_duplicate_ddl(exc):
-                        raise
-            # uniqueness constraint
-            await run_safe(
-                f"""
-                CREATE CONSTRAINT ON (n:{self.NODE_LABEL})
-                ASSERT n.namespace, n.key IS UNIQUE
-                """
-            )
-            # expiry index
-            await run_safe(f"CREATE INDEX ON :{self.NODE_LABEL}(expire_at)")
-            # vector index (optional)
-            if self._vector_cfg:
-                await run_safe(self._vector_index_cypher(self._vector_cfg))
-        self._setup_done = True
-        if self._ttl_cfg and self._ttl_cfg.sweep_interval_minutes:
-            self._start_ttl_sweeper()
-
-    initialise = setup  # alias
-
-    def _start_ttl_sweeper(self) -> None:
-        if self._ttl_task or not self._ttl_cfg or not self._ttl_cfg.sweep_interval_minutes:
-            return
-
-        async def _loop() -> None:
-            await asyncio.sleep(0)
-            interval = self._ttl_cfg.sweep_interval_minutes * 60  # type: ignore[operator]
-            while True:
-                await asyncio.sleep(interval)
-                try:
-                    await self.sweep_ttl()
-                except Exception:  # pragma: no cover
-                    logger.exception("Async TTL sweep failed")
-        self._ttl_task = asyncio.create_task(_loop())
-
-    async def sweep_ttl(self) -> None:
-        async with self._driver.session() as sess:  # type: ignore[attr-defined]
-            async def _tx(tx):
-                await (
-                    await tx.run(
-                        f"""
-                        MATCH (n:{self.NODE_LABEL})
-                        WHERE n.expire_at IS NOT NULL AND n.expire_at < datetime()
-                        DETACH DELETE n
-                        """
-                    )
-                ).consume()
-            await sess.execute_write(_tx)
-
-    def _expiry_dt(self, ttl_minutes: float | None) -> Optional[str]:
-        if ttl_minutes is None and self._ttl_cfg:
-            ttl_minutes = self._ttl_cfg.default_ttl
-        if ttl_minutes is None:
-            return None
-        return (datetime.now(tz=timezone.utc) + timedelta(minutes=ttl_minutes)).isoformat()
-
-    async def _refresh_node_ttl(self, namespace: Tuple[str, ...], key: str) -> None:
-        exp = self._expiry_dt(None)
-        async with self._driver.session() as sess:  # type: ignore[attr-defined]
-            await (
-                await sess.run(
-                    f"""
-                    MATCH (n:{self.NODE_LABEL})
-                    WHERE n.namespace = $ns AND n.key = $key
-                    SET n.expire_at = datetime($exp)
-                    """,
-                    ns=list(namespace),
-                    key=key,
-                    exp=exp,
-                )
-            ).consume()
-
-    async def aput(
-        self,
-        namespace: Tuple[str, ...],
-        key: str,
-        value: Any,
+    @asynccontextmanager
+    async def from_uri(
+        cls,
+        uri: str,
         *,
-        index: bool = True,
-        ttl: float | None = None,
-    ) -> Item:
-        if not (
-            isinstance(namespace, (tuple, list)) and all(isinstance(p, str) for p in namespace)
-        ):
-            raise TypeError("namespace must be tuple[str, ...]")
-        value_json = json.dumps(value, default=str)
-        embed_vec: List[float] | None = None
-        if index and self._vector_cfg and self._vector_cfg.embed:
-            embed_vec = self._vector_cfg.embed.embed_documents([value_json])[0]
-            if hasattr(embed_vec, "tolist"):
-                embed_vec = embed_vec.tolist()
-        exp = self._expiry_dt(ttl)
-        async with self._driver.session() as sess:
-            async def _tx(tx):
-                await (
-                    await tx.run(
-                        f"""
-                        MATCH (n:{self.NODE_LABEL})
-                        WHERE n.namespace = $ns AND n.key = $key
-                        DETACH DELETE n
-                        """,
-                        ns=list(namespace),
-                        key=key,
-                    )
-                ).consume()
-                await (
-                    await tx.run(
-                        f"""
-                        CREATE (n:{self.NODE_LABEL} {{
-                            namespace: $ns,
-                            key: $key,
-                            value: $val,
-                            expire_at: (
-                                CASE WHEN $exp IS NULL THEN NULL ELSE datetime($exp) END
-                            ),
-                            embedding: $embedding
-                        }})
-                        """,
-                        ns=list(namespace),
-                        key=key,
-                        val=value_json,
-                        exp=exp,
-                        embedding=embed_vec,
-                    )
-                ).consume()
-            await sess.execute_write(_tx)
-        return self._build_item(
-            namespace=namespace,
-            key=key,
-            value=value,
-            expires_at=exp,
-        )
+        auth: tuple[str, str] | None = None,
+        database: str = "memgraph",
+        index: MemgraphIndexConfig | None = None,
+        ttl: TTLConfig | None = None,
+    ) -> AsyncIterator[Self]:
+        """Create a new AsyncMemgraphStore instance from a connection URI."""
+        driver = AsyncGraphDatabase.driver(uri, auth=auth)
+        try:
+            yield cls(driver, database=database, index=index, ttl=ttl)
+        finally:
+            await driver.close()
 
-    async def aput_many(
-        self,
-        namespace: Tuple[str, ...],
-        items: Iterable[Tuple[str, Any]],
-        *,
-        index: bool = True,
-        ttl: float | None = None,
-    ) -> None:
-        for k, v in items:
-            await self.aput(namespace, k, v, index=index, ttl=ttl)
+    @asynccontextmanager
+    async def _asession(self) -> AsyncIterator[AsyncSession]:
+        """Get an async session."""
+        async with self.conn.session(database=self.database) as session:
+            yield session
 
-    async def aget(
-        self,
-        namespace: Tuple[str, ...],
-        key: str,
-        *,
-        refresh_ttl: bool | None = None,
-    ) -> Optional[Item]:
-        async with self._driver.session() as sess:
+    @asynccontextmanager
+    async def _atransaction(
+        self, session: AsyncSession | None = None
+    ) -> AsyncIterator[AsyncTransaction]:
+        """Get an async transaction."""
+        if session:
+            async with session.begin_transaction() as tx:
+                yield tx
+        else:
+            async with self._asession() as s:
+                async with s.begin_transaction() as tx:
+                    yield tx
 
-            async def _read(tx):
-                r = await tx.run(
-                    f"""
-                    MATCH (n:{self.NODE_LABEL})
-                    WHERE n.namespace = $ns AND n.key = $key
-                    RETURN n LIMIT 1
-                    """,
-                    ns=list(namespace),
-                    key=key,
+    async def abatch(self, ops: Iterable[Op]) -> list[Result]:
+        """Execute a batch of operations asynchronously."""
+        grouped_ops, num_ops = _group_ops(ops)
+        results: list[Result] = [None] * num_ops
+
+        async with self._atransaction() as tx:
+            if GetOp in grouped_ops:
+                await self._abatch_get_ops(
+                    cast(Sequence[tuple[int, GetOp]], grouped_ops[GetOp]), results, tx
                 )
-                return await r.single()
-
-            rec = await sess.execute_read(_read)
-        if not rec:
-            return None
-        n = rec["n"]
-        if n.get("expire_at") and n["expire_at"] < datetime.now(tz=timezone.utc):
-            await self.adelete(namespace, key)
-            return None
-        if refresh_ttl or (
-            refresh_ttl is None and self._ttl_cfg and self._ttl_cfg.refresh_on_read
-        ):
-            await self._refresh_node_ttl(namespace, key)
-            n["expire_at"] = self._expiry_dt(None)
-        return self._build_item(
-            namespace=tuple(n["namespace"]),
-            key=n["key"],
-            value=json.loads(n["value"]),
-            expires_at=n.get("expire_at"),
-        )
-
-    async def aexists(self, namespace: Tuple[str, ...], key: str) -> bool:
-        async with self._driver.session() as sess:
-            rec = await sess.run(
-                f"""
-                MATCH (n:{self.NODE_LABEL})
-                WHERE n.namespace = $ns AND n.key = $key
-                RETURN 1 LIMIT 1
-                """,
-                ns=list(namespace),
-                key=key,
-            )
-            return (await rec.single()) is not None
-
-    async def acount(self, namespace_prefix: Tuple[str, ...]) -> int:
-        pred = self._cypher_ns_prefix_filter(namespace_prefix)
-        async with self._driver.session() as sess:
-            rec = await sess.run(
-                f"""
-                MATCH (n:{self.NODE_LABEL})
-                WHERE {pred}
-                RETURN count(n) AS cnt
-                """
-            )
-            row = await rec.single()
-        return int(row["cnt"]) if row else 0
-
-    async def alist_keys(self, namespace: Tuple[str, ...]) -> List[str]:
-        pred = self._cypher_ns_prefix_filter(namespace)
-        async with self._driver.session() as sess:
-            res = await sess.run(
-                f"""
-                MATCH (n:{self.NODE_LABEL})
-                WHERE {pred}
-                RETURN n.key AS k
-                """
-            )
-            return [r["k"] async for r in res]
-
-    async def alist_items(self, namespace: Tuple[str, ...]) -> List[Item]:
-        pred = self._cypher_ns_prefix_filter(namespace)
-        items: List[Item] = []
-        async with self._driver.session() as sess:
-            res = await sess.run(
-                f"""
-                MATCH (n:{self.NODE_LABEL})
-                WHERE {pred}
-                RETURN n
-                """
-            )
-            async for rec in res:
-                n = rec["n"]
-                items.append(
-                    self._build_item(
-                        namespace=tuple(n["namespace"]),
-                        key=n["key"],
-                        value=json.loads(n["value"]),
-                        expires_at=n.get("expire_at"),
-                    )
+            if SearchOp in grouped_ops:
+                await self._abatch_search_ops(
+                    cast(Sequence[tuple[int, SearchOp]], grouped_ops[SearchOp]),
+                    results,
+                    tx,
                 )
-        return items
-
-    async def adelete(self, namespace: Tuple[str, ...], key: str) -> None:
-        async with self._driver.session() as sess:
-            async def _tx(tx):
-                await (
-                    await tx.run(
-                        f"""
-                        MATCH (n:{self.NODE_LABEL})
-                        WHERE n.namespace = $ns AND n.key = $key
-                        DETACH DELETE n
-                        """,
-                        ns=list(namespace),
-                        key=key,
-                    )
-                ).consume()
-            await sess.execute_write(_tx)
-
-    async def adelete_namespace(self, namespace_prefix: Tuple[str, ...]) -> None:
-        pred = self._cypher_ns_prefix_filter(namespace_prefix)
-        async with self._driver.session() as sess:
-            async def _tx(tx):
-                await (
-                    await tx.run(
-                        f"""
-                        MATCH (n:{self.NODE_LABEL})
-                        WHERE {pred}
-                        DETACH DELETE n
-                        """
-                    )
-                ).consume()
-
-            await sess.execute_write(_tx)
-
-    async def asearch(
-        self,
-        namespace_prefix: Tuple[str, ...],
-        *,
-        query: str | Sequence[float] | None = None,
-        filter: Mapping[str, Any] | None = None,
-        limit: int = 10,
-        offset: int = 0,
-        refresh_ttl: bool | None = None,
-    ) -> List[Item]:
-        pred = self._cypher_ns_prefix_filter(namespace_prefix)
-        items: List[Item] = []
-        if (
-            query is not None
-            and self._vector_cfg
-            and self._vector_cfg.embed
-            and isinstance(query, str)
-        ):
-            q_vec = self._vector_cfg.embed.embed_query(query)
-            if hasattr(q_vec, "tolist"):
-                q_vec = q_vec.tolist()
-            k = limit + offset
-            params: Dict[str, Any] = {"vec": q_vec, "k": k}
-            cypher = f"""
-                CALL vector_search.search("{self._vector_cfg.name}", $k, $vec)
-                YIELD node, similarity
-                WITH node, similarity
-                WHERE {pred}
-            """
-            if filter:
-                for fk, fv in filter.items():
-                    cypher += f" AND node.{fk} = ${fk} "
-                    params[fk] = fv
-            cypher += """
-                RETURN node, similarity
-                ORDER BY similarity DESC
-                LIMIT $k
-            """
-            async with self._driver.session() as sess:
-                res = await sess.run(cypher, **params)
-                rows = await res.data()
-                for rec in rows[offset : offset + limit]:
-                    n = rec["node"]
-                    if refresh_ttl or (
-                        refresh_ttl is None
-                        and self._ttl_cfg
-                        and self._ttl_cfg.refresh_on_read
-                    ):
-                        await self._refresh_node_ttl(tuple(n["namespace"]), n["key"])
-                    items.append(
-                        self._build_item(
-                            namespace=tuple(n["namespace"]),
-                            key=n["key"],
-                            value=json.loads(n["value"]),
-                            score=rec["similarity"],
-                            expires_at=n.get("expire_at"),
-                        )
-                    )
-            return items
-        params: Dict[str, Any] = {"limit": limit, "offset": offset}
-        cypher = f"""
-            MATCH (n:{self.NODE_LABEL})
-            WHERE {pred}
-        """
-        if query:
-            cypher += " AND n.value CONTAINS $query "
-            params["query"] = query
-        if filter:
-            for fk, fv in filter.items():
-                cypher += f" AND n.{fk} = ${fk} "
-                params[fk] = fv
-        cypher += """
-            RETURN n
-            SKIP $offset
-            LIMIT $limit
-        """
-        async with self._driver.session() as sess:
-            res = await sess.run(cypher, **params)
-            async for rec in res:
-                n = rec["n"]
-                if refresh_ttl or (
-                    refresh_ttl is None
-                    and self._ttl_cfg
-                    and self._ttl_cfg.refresh_on_read
-                ):
-                    await self._refresh_node_ttl(tuple(n["namespace"]), n["key"])
-                items.append(
-                    self._build_item(
-                        namespace=tuple(n["namespace"]),
-                        key=n["key"],
-                        value=json.loads(n["value"]),
-                        expires_at=n.get("expire_at"),
-                    )
+            if ListNamespacesOp in grouped_ops:
+                await self._abatch_list_namespaces_ops(
+                    cast(
+                        Sequence[tuple[int, ListNamespacesOp]],
+                        grouped_ops[ListNamespacesOp],
+                    ),
+                    results,
+                    tx,
                 )
-        return items
+            if PutOp in grouped_ops:
+                await self._abatch_put_ops(
+                    cast(Sequence[tuple[int, PutOp]], grouped_ops[PutOp]), tx
+                )
 
-    async def abatch(self, ops: Iterable[Any]) -> list[Any]:
-        results = []
-        for op in ops:
-            if hasattr(op, "operation") and hasattr(op, "namespace") and hasattr(op, "key"):
-                if op.operation == "get":
-                    result = await self.aget(op.namespace, op.key)
-                elif op.operation == "put":
-                    result = await self.aput(op.namespace, op.key, op.value)
-                elif op.operation == "delete":
-                    await self.adelete(op.namespace, op.key)
-                    result = None
-                else:
-                    raise ValueError(f"Unknown operation: {op.operation}")
-                results.append(result)
-            else:
-                raise ValueError(f"Invalid operation format: {op}")
         return results
 
-    def batch(self, ops: Iterable[Any]) -> list[Any]:
-        import asyncio
-        return asyncio.run(self.abatch(ops))
+    async def _abatch_get_ops(
+        self,
+        get_ops: Sequence[tuple[int, GetOp]],
+        results: list[Result],
+        tx: AsyncTransaction,
+    ) -> None:
+        """Handle GetOp operations in a batch."""
+        for query, params, namespace, items in self._get_batch_GET_ops_queries(get_ops):
+            result = await tx.run(query, params)
+            key_to_idx = {item["key"]: item["idx"] for item in items}
+            async for record in result:
+                idx = key_to_idx.get(record["key"])
+                if idx is not None:
+                    results[idx] = _record_to_item(
+                        namespace, record.data(), loader=self._deserializer
+                    )
+
+    async def _abatch_put_ops(
+        self,
+        put_ops: Sequence[tuple[int, PutOp]],
+        tx: AsyncTransaction,
+    ) -> None:
+        """Handle PutOp operations in a batch."""
+        queries, embedding_request = self._prepare_batch_PUT_queries(put_ops)
+
+        for query, params in queries:
+            await tx.run(query, params)
+
+        if embedding_request:
+            if self.embeddings is None:
+                raise ValueError(
+                    "Embedding configuration is required for vector operations."
+                )
+
+            query, txt_params = embedding_request
+            unique_texts = sorted({param[-1] for param in txt_params})
+            vectors = await self.embeddings.aembed_documents(unique_texts)
+            text_to_vector = dict(zip(unique_texts, vectors))
+
+            embedding_batch = [
+                {"prefix": ns, "key": k, "embedding": text_to_vector[text]}
+                for (ns, k, text) in txt_params
+            ]
+
+            await tx.run(query, {"batch": embedding_batch})
+
+    async def _abatch_search_ops(
+        self,
+        search_ops: Sequence[tuple[int, SearchOp]],
+        results: list[Result],
+        tx: AsyncTransaction,
+    ) -> None:
+        """Handle SearchOp operations in a batch."""
+        queries, embedding_requests = self._prepare_batch_search_queries(search_ops)
+
+        op_idx_to_params = {
+            op_idx: queries[i][1] for i, (op_idx, _) in enumerate(search_ops)
+        }
+
+        if embedding_requests and self.embeddings:
+            unique_texts = sorted({text for _, text in embedding_requests})
+            embeddings = await self.embeddings.aembed_documents(unique_texts)
+            text_to_embedding = dict(zip(unique_texts, embeddings))
+
+            for op_idx, text in embedding_requests:
+                if op_idx in op_idx_to_params:
+                    op_idx_to_params[op_idx]["embedding"] = text_to_embedding[text]
+
+        for i, (op_idx, _) in enumerate(search_ops):
+            query, params = queries[i]
+            result = await tx.run(query, params)
+            search_items = [
+                _record_to_search_item(
+                    _decode_ns_text(record["prefix"]),
+                    record.data(),
+                    loader=self._deserializer,
+                )
+                async for record in result
+            ]
+            results[op_idx] = search_items
+
+    async def _abatch_list_namespaces_ops(
+        self,
+        list_ops: Sequence[tuple[int, ListNamespacesOp]],
+        results: list[Result],
+        tx: AsyncTransaction,
+    ) -> None:
+        """Handle ListNamespacesOp operations in a batch."""
+        queries = self._get_batch_list_namespaces_queries(list_ops)
+        for i, (op_idx, _) in enumerate(list_ops):
+            query, params = queries[i]
+            result = await tx.run(query, params)
+            namespaces = [
+                _decode_ns_text(row["truncated_prefix"])
+                async for row in result
+                if row["truncated_prefix"]
+            ]
+            results[op_idx] = namespaces
+
+    async def setup(self) -> None:
+        """Set up the store database asynchronously."""
+
+        async def _get_version(tx: AsyncTransaction, table: str) -> int:
+            result = await tx.run(
+                """
+                MERGE (m:Migration {name: $table})
+                ON CREATE SET m.version = -1
+                RETURN m.version AS v
+                """,
+                {"table": table},
+            )
+            record = await result.single()
+            return record["v"] if record else -1
+
+        async def _set_version(tx: AsyncTransaction, table: str, version: int) -> None:
+            await tx.run(
+                """
+                MATCH (m:Migration {name: $table})
+                SET m.version = $version
+                """,
+                {"table": table, "version": version},
+            )
+
+        async with self._asession() as session:
+            # Main migrations
+            async with session.begin_transaction() as tx:
+                version = await _get_version(tx, "store_migrations")
+            for v, cypher in enumerate(
+                self.MIGRATIONS[version + 1 :], start=version + 1
+            ):
+                try:
+                    await session.run(cypher)
+                    async with session.begin_transaction() as tx:
+                        await _set_version(tx, "store_migrations", v)
+                except Exception as e:
+                    logger.error(
+                        f"Failed to apply migration {v}.\\nCypher={cypher}\\nError={e}"
+                    )
+                    raise
+
+            # Vector migrations
+            if self.index_config:
+                async with session.begin_transaction() as tx:
+                    version = await _get_version(tx, "vector_migrations")
+                for v, migration in enumerate(
+                    self.VECTOR_MIGRATIONS[version + 1 :], start=version + 1
+                ):
+                    if migration.condition and not migration.condition(self):
+                        continue
+                    cypher = migration.cypher
+                    params = {}
+                    if migration.params:
+                        params = {
+                            k: val(self) if callable(val) else val
+                            for k, val in migration.params.items()
+                        }
+                    final_cypher = cypher.format(**params)
+                    try:
+                        await session.run(final_cypher)
+                        async with session.begin_transaction() as tx:
+                            await _set_version(tx, "vector_migrations", v)
+                    except Exception as e:
+                        logger.error(
+                            f"Failed to apply vector migration {v}.\\nCypher={final_cypher}\\nError={e}"
+                        )
+                        raise
+
+    async def sweep_ttl(self) -> int:
+        """Delete expired store items based on TTL."""
+        async with self._asession() as session:
+            result = await session.run(
+                """
+                MATCH (n:StoreItem)
+                WHERE n.expires_at IS NOT NULL AND n.expires_at < localdatetime()
+                DETACH DELETE n
+                RETURN count(n) as deleted_count
+                """
+            )
+            record = await result.single()
+            return record.data()["deleted_count"] if record else 0
+
+    async def start_ttl_sweeper(
+        self, sweep_interval_minutes: int | None = None
+    ) -> asyncio.Task[None]:
+        """Periodically delete expired store items based on TTL."""
+        if not self.ttl_config:
+            return asyncio.create_task(asyncio.sleep(0))
+
+        if self._ttl_sweeper_task and not self._ttl_sweeper_task.done():
+            return self._ttl_sweeper_task
+
+        self._ttl_stop_event.clear()
+        interval = float(
+            sweep_interval_minutes or self.ttl_config.get("sweep_interval_minutes") or 5
+        )
+        logger.info(f"Starting store TTL sweeper with interval {interval} minutes")
+
+        async def _sweep_loop() -> None:
+            while not self._ttl_stop_event.is_set():
+                try:
+                    # Wait for the given interval or until the stop event is set
+                    await asyncio.wait_for(
+                        self._ttl_stop_event.wait(), timeout=interval * 60
+                    )
+                    # If wait finishes without timeout, it means stop event was set
+                    break
+                except asyncio.TimeoutError:
+                    # This is the normal path, timeout occurred, so we sweep
+                    pass
+                except asyncio.CancelledError:
+                    # Task was cancelled
+                    break
+
+                if self._ttl_stop_event.is_set():
+                    break
+
+                try:
+                    expired_items = await self.sweep_ttl()
+                    if expired_items > 0:
+                        logger.info(f"Store swept {expired_items} expired items")
+                except asyncio.CancelledError:
+                    break
+                except Exception as exc:
+                    logger.exception("Store TTL sweep iteration failed", exc_info=exc)
+
+        task = asyncio.create_task(_sweep_loop())
+        task.set_name("ttl_sweeper")
+        self._ttl_sweeper_task = task
+        return task
+
+    async def stop_ttl_sweeper(self, timeout: float | None = None) -> bool:
+        """Stop the TTL sweeper task if it's running."""
+        if not self._ttl_sweeper_task or self._ttl_sweeper_task.done():
+            return True
+
+        logger.info("Stopping TTL sweeper task")
+        self._ttl_stop_event.set()
+        try:
+            await asyncio.wait_for(self._ttl_sweeper_task, timeout=timeout)
+            logger.info("TTL sweeper task stopped gracefully.")
+            self._ttl_sweeper_task = None
+            return True
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Timed out waiting for TTL sweeper task to stop. Cancelling."
+            )
+            self._ttl_sweeper_task.cancel()
+            try:
+                # Wait a moment for cancellation to propagate
+                await self._ttl_sweeper_task
+            except asyncio.CancelledError:
+                pass
+            self._ttl_sweeper_task = None
+            return False
+        except asyncio.CancelledError:
+            # This can happen if the task is cancelled externally
+            logger.info("TTL sweeper task was already cancelled during stop.")
+            self._ttl_sweeper_task = None
+            return True
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        await self.stop_ttl_sweeper(timeout=2.0)
