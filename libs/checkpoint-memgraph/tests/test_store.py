@@ -1,3 +1,4 @@
+"""
 from __future__ import annotations
 
 import time
@@ -29,7 +30,6 @@ TTL_MINUTES = TTL_SECONDS / 60
 
 @pytest.fixture(scope="session")
 def driver() -> Generator[Driver, Any, None]:
-    """Create a single, session-scoped driver for all tests to ensure stability."""
     parsed = urlparse(DEFAULT_MEMGRAPH_URI)
     uri = f"{parsed.scheme}://{parsed.hostname}:{parsed.port or 7687}"
     auth = (unquote(parsed.username or ""), unquote(parsed.password or ""))
@@ -41,7 +41,6 @@ def driver() -> Generator[Driver, Any, None]:
 
 @pytest.fixture(scope="function")
 def store(driver: Driver) -> Generator[MemgraphStore, Any, None]:
-    """Create a store instance using the shared driver, cleaning the DB before each test."""
     ttl_config = {
         "default_ttl": TTL_MINUTES,
         "refresh_on_read": True,
@@ -66,10 +65,6 @@ def store(driver: Driver) -> Generator[MemgraphStore, Any, None]:
 
 
 def test_from_conn_string():
-    """
-    Tests the from_conn_string method in isolation to ensure it works
-    without affecting the stability of the main test suite.
-    """
     namespace = ("test_conn_string",)
     key = "key1"
     with MemgraphStore.from_conn_string(DEFAULT_MEMGRAPH_URI) as store:
@@ -364,7 +359,6 @@ def vector_store(
     request: Any,
     fake_embeddings: Embeddings,
 ) -> Generator[MemgraphStore, Any, None]:
-    """Create a vector store instance using the shared driver."""
     distance_type, enable_ttl = request.param
 
     index_config: MemgraphIndexConfig = {
@@ -395,7 +389,6 @@ def _create_vector_store_with_text_fields(
     fake_embeddings: Embeddings,
     text_fields: list[str] | None = None,
 ) -> Generator[MemgraphStore, Any, None]:
-    """A context manager for creating a vector store with specific text fields."""
     index_config: MemgraphIndexConfig = {
         "dims": fake_embeddings.dims,
         "embed": fake_embeddings,
@@ -638,3 +631,4 @@ def test_store_ttl(store: MemgraphStore):
     # Now it should have expired
     res = store.get(ns, key="item2", refresh_ttl=False)
     assert res is None
+"""
