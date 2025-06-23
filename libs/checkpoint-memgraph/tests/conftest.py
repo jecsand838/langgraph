@@ -38,3 +38,5 @@ def clear_test_db(conn: Session) -> None:
 @pytest.fixture
 def fake_embeddings() -> CharacterEmbeddings:
     return CharacterEmbeddings(dims=500)
+
+VECTOR_TYPES = ["vector", "halfvec"]

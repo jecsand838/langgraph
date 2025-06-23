@@ -88,11 +88,7 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
         self._deserializer = deserializer or (lambda v: orjson.loads(v))
         self.conn = conn
         self.lock = asyncio.Lock()
-        try:
-            self.loop = asyncio.get_running_loop()
-        except RuntimeError:
-            self.loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self.loop)
+        self.loop = asyncio.get_running_loop()
 
         self.index_config = index
         if self.index_config:
@@ -154,89 +150,6 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
     async def _transaction(self, session: AsyncSession) -> AsyncIterator[AsyncTransaction]:
         async with await session.begin_transaction() as tx:
             yield tx
-
-    def batch(self, ops: Iterable[Op]) -> list[Result]:
-        """The sync version of batch.
-        Runs the async version in the event loop the store was created in.
-        """
-        try:
-            current_loop = asyncio.get_running_loop()
-            if current_loop is self.loop:
-                raise asyncio.InvalidStateError(
-                    "Cannot make sync calls from an async context. Use async methods instead."
-                )
-        except RuntimeError:
-            future = asyncio.run_coroutine_threadsafe(self.abatch(ops), self.loop)
-            return future.result(timeout=30)
-        with asyncio.Runner() as runner:
-            return runner.run(self.abatch(ops))
-
-    def put(
-        self,
-        namespace: tuple[str, ...],
-        value: Any,
-        key: str = "default",
-        *,
-        ttl: float | None = None,
-        index: list[str] | None | Literal[False] = None,
-    ) -> None:
-        self.batch([PutOp(namespace=namespace, key=key, value=value, ttl=ttl, index=index)])
-
-    def get(
-        self,
-        namespace: tuple[str, ...],
-        key: str = "default",
-        *,
-        refresh_ttl: bool = False,
-    ) -> Item | None:
-        results = self.batch([GetOp(namespace=namespace, key=key, refresh_ttl=refresh_ttl)])
-        return results[0] if results else None
-
-    def delete(self, namespace: tuple[str, ...], key: str = "default") -> None:
-        self.batch([PutOp(namespace=namespace, key=key, value=None)])
-
-    def search(
-        self,
-        namespace_prefix: tuple[str, ...],
-        *,
-        query: str | None = None,
-        filter: dict[str, Any] | None = None,
-        limit: int | None = None,
-        offset: int = 0,
-        refresh_ttl: bool = False,
-    ) -> list[SearchItem]:
-        results = self.batch(
-            [
-                SearchOp(
-                    namespace_prefix=namespace_prefix,
-                    query=query,
-                    filter=filter,
-                    limit=limit,
-                    offset=offset,
-                    refresh_ttl=refresh_ttl,
-                )
-            ]
-        )
-        return results[0] if results else []
-
-    def list_namespaces(
-        self,
-        *,
-        prefix: tuple[str, ...] | None = None,
-        limit: int | None = None,
-        offset: int = 0,
-    ) -> list[tuple[str, ...]]:
-        match_conditions = (
-            [MatchCondition(path=prefix, match_type="prefix")] if prefix else None
-        )
-        results = self.batch(
-            [
-                ListNamespacesOp(
-                    match_conditions=match_conditions, limit=limit, offset=offset
-                )
-            ]
-        )
-        return results[0] if results else []
 
     def _prepare_batch_PUT_queries(
         self,
@@ -417,10 +330,6 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
 
         async with self._session() as session:
             async with self.lock, self._transaction(session) as tx:
-                if PutOp in grouped_ops:
-                    await self._batch_put_ops(
-                        cast(Sequence[tuple[int, PutOp]], grouped_ops[PutOp]), tx
-                    )
                 if GetOp in grouped_ops:
                     await self._batch_get_ops(
                         cast(Sequence[tuple[int, GetOp]], grouped_ops[GetOp]),
@@ -441,6 +350,10 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
                         ),
                         results,
                         tx,
+                    )
+                if PutOp in grouped_ops:
+                    await self._batch_put_ops(
+                        cast(Sequence[tuple[int, PutOp]], grouped_ops[PutOp]), tx
                     )
         return results
 
@@ -487,7 +400,7 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
             text_to_vector = dict(zip(unique_texts, vectors))
 
             embedding_batch = [
-                {"prefix": _namespace_to_text(ns), "key": k, "embedding": text_to_vector[text]}
+                {"prefix": ns, "key": k, "embedding": text_to_vector[text]}
                 for (ns, k, text) in txt_params
             ]
 
@@ -634,6 +547,11 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
         """For tests only. Cleans the entire database."""
         async with self._session() as session:
             await session.run("MATCH (n) DETACH DELETE n")
+            try:
+                # Best effort to drop the index if it exists
+                await session.run("DROP INDEX vector_index")
+            except Exception:
+                pass
 
     async def sweep_ttl(self) -> int:
         """Delete expired store items based on TTL."""

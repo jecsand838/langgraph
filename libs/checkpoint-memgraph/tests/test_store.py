@@ -1,4 +1,3 @@
-"""
 from __future__ import annotations
 
 import time
@@ -343,9 +342,7 @@ def test_search(store) -> None:
         store.delete(namespace, key)
 
 
-_vector_params = [
-    (distance_type, True) for distance_type in ["l2", "cosine", "inner_product"]
-]
+_vector_params = [(metric, True) for metric in ["l2sq", "cos", "ip"]]
 _vector_params += [(_vector_params[-1][0], False)]
 
 
@@ -359,12 +356,13 @@ def vector_store(
     request: Any,
     fake_embeddings: Embeddings,
 ) -> Generator[MemgraphStore, Any, None]:
-    distance_type, enable_ttl = request.param
+    metric, enable_ttl = request.param
 
     index_config: MemgraphIndexConfig = {
-        "dims": fake_embeddings.dims,
+        "dimension": fake_embeddings.dims,
+        "capacity": 1000,
         "embed": fake_embeddings,
-        "distance_type": distance_type,
+        "metric": metric,
         "fields": ["text"],
     }
     ttl_config = {"default_ttl": 2, "refresh_on_read": True} if enable_ttl else None
@@ -385,14 +383,15 @@ def vector_store(
 @contextmanager
 def _create_vector_store_with_text_fields(
     driver: Driver,
-    distance_type: str,
+    metric: str,
     fake_embeddings: Embeddings,
     text_fields: list[str] | None = None,
 ) -> Generator[MemgraphStore, Any, None]:
     index_config: MemgraphIndexConfig = {
-        "dims": fake_embeddings.dims,
+        "dimension": fake_embeddings.dims,
+        "capacity": 1000,
         "embed": fake_embeddings,
-        "distance_type": distance_type,
+        "metric": metric,
         "fields": text_fields,
     }
     with driver.session() as session:
@@ -410,7 +409,7 @@ def test_vector_store_initialization(
     vector_store: MemgraphStore, fake_embeddings: CharacterEmbeddings
 ) -> None:
     assert vector_store.index_config is not None
-    assert vector_store.index_config["dims"] == fake_embeddings.dims
+    assert vector_store.index_config["dimension"] == fake_embeddings.dims
     assert vector_store.index_config["embed"] == fake_embeddings
 
 
@@ -515,7 +514,7 @@ def test_embed_with_path_sync(
 ) -> None:
     with _create_vector_store_with_text_fields(
         driver,
-        "cosine",
+        "cos",
         fake_embeddings,
         text_fields=["key0", "key1", "key3"],
     ) as store:
@@ -542,7 +541,7 @@ def test_embed_with_path_operation_config(
     fake_embeddings: CharacterEmbeddings,
 ) -> None:
     with _create_vector_store_with_text_fields(
-        driver, "cosine", fake_embeddings, text_fields=["key17"]
+        driver, "cos", fake_embeddings, text_fields=["key17"]
     ) as store:
         doc3 = {"key0": "aaa", "key1": "bbb"}
         doc4 = {"key0": "eee", "key1": "bbb"}
@@ -572,16 +571,16 @@ def _inner_product(X: list[float], Y: list[float]) -> float:
     return sum(a * b for a, b in zip(X, Y))
 
 
-@pytest.mark.parametrize("distance_type", ["cosine", "inner_product", "l2"])
+@pytest.mark.parametrize("metric", ["cos", "ip", "l2sq"])
 @pytest.mark.parametrize("query", ["aaa", "bbb", "ccc", "abcd", "poisson"])
 def test_scores(
     driver: Driver,
     fake_embeddings: CharacterEmbeddings,
-    distance_type: str,
+    metric: str,
     query: str,
 ) -> None:
     with _create_vector_store_with_text_fields(
-        driver, distance_type, fake_embeddings, text_fields=["key0"]
+        driver, metric, fake_embeddings, text_fields=["key0"]
     ) as store:
         doc = {"key0": "aaa"}
         store.put(("test",), "doc", doc)
@@ -590,13 +589,13 @@ def test_scores(
         vec0 = fake_embeddings.embed_query(doc["key0"])
         vec1 = fake_embeddings.embed_query(query)
 
-        if distance_type == "cosine":
+        if metric == "cos":
             similarity = _cosine_similarity(vec1, vec0)
-        elif distance_type == "inner_product":
+        elif metric == "ip":
             similarity = _inner_product(vec1, vec0)
-        else:  # l2
-            l2_dist = sum((a - b) ** 2 for a, b in zip(vec1, vec0)) ** 0.5
-            similarity = 1 / (1 + l2_dist)
+        else:  # l2sq
+            l2_dist_sq = sum((a - b) ** 2 for a, b in zip(vec1, vec0))
+            similarity = 1 / (1 + l2_dist_sq**0.5)
 
         assert len(results) == 1
         assert results[0].score == pytest.approx(similarity, abs=1e-3)
@@ -631,4 +630,3 @@ def test_store_ttl(store: MemgraphStore):
     # Now it should have expired
     res = store.get(ns, key="item2", refresh_ttl=False)
     assert res is None
-"""
