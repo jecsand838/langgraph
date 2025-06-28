@@ -64,8 +64,10 @@ async def store(async_driver: AsyncDriver) -> AsyncIterator[AsyncMemgraphStore]:
     # Clean the database before each test run
     async with async_driver.session() as session:
         await session.run("MATCH (n) DETACH DELETE n")
+        time.sleep(0.5)
         try:
             await session.run("DROP VECTOR INDEX vector_index")
+            time.sleep(0.5)
         except Exception:
             pass
 
@@ -348,15 +350,15 @@ async def _create_vector_store(
         "distance_type": distance_type,
         "fields": text_fields,
     }
-    store = AsyncMemgraphStore(async_driver, index=index_config)
     async with async_driver.session() as session:
         await session.run("MATCH (n) DETACH DELETE n")
-        time.sleep(1)  # Ensure the database is clean before setup
+        time.sleep(0.5)
         try:
             await session.run("DROP VECTOR INDEX vector_index")
-            time.sleep(1)  # Ensure the database is clean before setup
+            time.sleep(0.5)
         except Exception:
             pass
+    store = AsyncMemgraphStore(async_driver, index=index_config)
     await store.setup()
     yield store
 
@@ -587,3 +589,66 @@ async def test_embed_with_path(
         assert len(results) == 2
         assert results[0].score < ascore
         assert results[1].score < ascore
+
+@pytest.mark.parametrize(
+    "vector_type,distance_type",
+    [
+        *itertools.product(["vector", "halfvec"], ["cosine", "inner_product", "l2"]),
+    ],
+)
+async def test_search_sorting(
+    request: Any,
+    async_driver: AsyncDriver,  # Argument added
+    fake_embeddings: CharacterEmbeddings,
+    vector_type: str,
+    distance_type: str,
+) -> None:
+    """Test operation-level field configuration for vector search."""
+    async with _create_vector_store(
+        async_driver,
+        vector_type,
+        distance_type,
+        fake_embeddings,
+        text_fields=["key1"],  # Default fields that won't match our test data
+    ) as store:
+        amatch = {
+            "key1": "mmm",
+        }
+
+        await store.aput(("test", "M"), "M", amatch)
+        N = 100
+        for i in range(N):
+            await store.aput(("test", "A"), f"A{i}", {"key1": "no"})
+        for i in range(N):
+            await store.aput(("test", "Z"), f"Z{i}", {"key1": "no"})
+
+        results = await store.asearch(("test",), query="mmm", limit=10)
+        assert len(results) == 10
+        assert len(set(r.key for r in results)) == 10
+        assert results[0].key == "M"
+        assert results[0].score > results[1].score
+
+
+async def test_store_ttl(store):
+    # Assumes a TTL of 1 minute = 60 seconds
+    ns = ("foo",)
+    await store.start_ttl_sweeper()
+    await store.aput(
+        ns,
+        key="item1",
+        value={"foo": "bar"},
+        ttl=TTL_MINUTES,  # type: ignore
+    )
+    await asyncio.sleep(TTL_SECONDS - 2)
+    res = await store.aget(ns, key="item1", refresh_ttl=True)
+    assert res is not None
+    await asyncio.sleep(TTL_SECONDS - 2)
+    results = await store.asearch(ns, query="foo", refresh_ttl=True)
+    assert len(results) == 1
+    await asyncio.sleep(TTL_SECONDS - 2)
+    res = await store.aget(ns, key="item1", refresh_ttl=False)
+    assert res is not None
+    await asyncio.sleep(TTL_SECONDS - 1)
+    # Now has been (TTL_SECONDS-2)*2 > TTL_SECONDS + TTL_SECONDS/2
+    results = await store.asearch(ns, query="bar", refresh_ttl=False)
+    assert len(results) == 0
