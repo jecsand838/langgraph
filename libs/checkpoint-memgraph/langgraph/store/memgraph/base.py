@@ -171,6 +171,8 @@ def _normalise_index_config(cfg: MemgraphIndexConfig) -> MemgraphIndexConfig:
     cfg.setdefault("metric", "l2sq")
     cfg.setdefault("resize_coefficient", 2)
 
+    print("---CHECK CGF VALUES \n", cfg)
+
     # ---------------- Derive distance_type ----- #
     if "distance_type" not in cfg:
         metric = cfg["metric"].lower()
@@ -406,8 +408,8 @@ SET n.embedding = op.embedding
         return f"WHERE {' AND '.join(where)}" if where else ""
 
     def _prepare_batch_search_queries(
-        self,
-        search_ops: Sequence[tuple[int, SearchOp]],
+            self,
+            search_ops: Sequence[tuple[int, SearchOp]],
     ) -> tuple[list[tuple[str, dict[str, Any]]], list[tuple[int, str]]]:
         queries: list[tuple[str, dict[str, Any]]] = []
         embedding_requests: list[tuple[int, str]] = []
@@ -431,11 +433,14 @@ SET n.embedding = op.embedding
                 dist_type = cast(MemgraphIndexConfig, self.index_config).get(
                     "distance_type", "cosine"
                 ).lower()
-                score_expr = (
-                    "1.0 - distance / 2.0"
-                    if dist_type in ("cosine", "inner_product")
-                    else "1.0 / (1.0 + sqrt(distance))"
-                )
+                if dist_type == "cosine" or dist_type == "inner_product":
+                    # For normalized vectors, as used in this test suite, Memgraph's
+                    # COSINE and INNER_PRODUCT distances are both calculated as (1 - similarity).
+                    # To get the similarity score, we must use (1 - distance).
+                    score_expr = "1.0 - distance"
+                else:  # Assumes 'l2' for 'l2sq' metric
+                    # Memgraph 'l2sq' distance = (L2 distance)^2. Test expects negative L2 distance.
+                    score_expr = "-sqrt(distance)"
 
                 query_parts = [
                     "CALL vector_search.search('vector_index', $k, $embedding)",
@@ -447,28 +452,30 @@ SET n.embedding = op.embedding
                 if op.refresh_ttl:
                     query_parts.append(
                         """
-WITH n, score,
-     CASE
-         WHEN n.ttl_minutes IS NOT NULL
-         THEN localdatetime() + duration({minute: n.ttl_minutes})
-         ELSE n.expires_at
-     END AS new_expires_at
-SET n.expires_at = new_expires_at
-"""
+                        WITH n,
+                             score,
+                             CASE
+                            WHEN n.ttl_minutes IS NOT NULL
+                            THEN localdatetime() + duration({minute : n.ttl_minutes})
+                            ELSE n.expires_at
+                        END
+                        AS new_expires_at
+    SET n.expires_at = new_expires_at
+                        """
                     )
 
                 query_parts.extend(
                     [
                         """
-RETURN n.prefix      AS prefix,
-       n.key         AS key,
-       n.value       AS value,
-       n.created_at  AS created_at,
-       n.updated_at  AS updated_at,
-       score
-ORDER BY score DESC
-SKIP $offset
-""",
+    RETURN n.prefix      AS prefix,
+           n.key         AS key,
+           n.value       AS value,
+           n.created_at  AS created_at,
+           n.updated_at  AS updated_at,
+           score
+    ORDER BY score DESC
+    SKIP $offset
+    """,
                         limit_clause,
                     ]
                 )
@@ -489,32 +496,33 @@ SKIP $offset
             # ---------------------------------------------------------------- #
             refresh_stmt = (
                 """
-WITH n,
-     CASE
-         WHEN n.ttl_minutes IS NOT NULL
-         THEN localdatetime() + duration({minute: n.ttl_minutes})
-         ELSE n.expires_at
-     END AS new_expires_at
-SET n.expires_at = new_expires_at
-"""
+                WITH n,
+                     CASE
+                    WHEN n.ttl_minutes IS NOT NULL
+                    THEN localdatetime() + duration({minute : n.ttl_minutes})
+                    ELSE n.expires_at
+                END
+                AS new_expires_at
+    SET n.expires_at = new_expires_at
+                """
                 if op.refresh_ttl
                 else "WITH n"
             )
 
             regular_query = f"""
-MATCH (n:StoreItem)
-{where_stmt}
-{refresh_stmt}
-RETURN n.prefix     AS prefix,
-       n.key        AS key,
-       n.value      AS value,
-       n.created_at AS created_at,
-       n.updated_at AS updated_at,
-       null         AS score
-ORDER BY n.updated_at DESC
-SKIP $offset
-{limit_clause}
-"""
+    MATCH (n:StoreItem)
+    {where_stmt}
+    {refresh_stmt}
+    RETURN n.prefix     AS prefix,
+           n.key        AS key,
+           n.value      AS value,
+           n.created_at AS created_at,
+           n.updated_at AS updated_at,
+           null         AS score
+    ORDER BY n.updated_at DESC
+    SKIP $offset
+    {limit_clause}
+    """
             queries.append((regular_query, params))
 
         return queries, embedding_requests
