@@ -51,7 +51,7 @@ def store(driver: Driver) -> Generator[MemgraphStore, Any, None]:
         session.run("MATCH (n) DETACH DELETE n").consume()
         try:
             # Drop index if it exists, to ensure a clean slate for vector tests
-            session.run("DROP VECTOR INDEX vector_index").consume()
+            session.run("DROP INDEX ON :Embedding(embedding)").consume()
         except Exception:
             pass  # Fails if the index does not exist, which is fine
 
@@ -61,7 +61,6 @@ def store(driver: Driver) -> Generator[MemgraphStore, Any, None]:
     store.start_ttl_sweeper()
     yield store
     store.stop_ttl_sweeper()
-
 
 def test_from_conn_string():
     namespace = ("test_conn_string",)
@@ -518,22 +517,54 @@ def test_embed_with_path_sync(
         fake_embeddings,
         text_fields=["key0", "key1", "key3"],
     ) as store:
-        doc1 = {"key1": "xxx", "key2": "yyy", "key3": "zzz"}
-        doc2 = {"key0": "uuu", "key1": "vvv", "key2": "www", "key3": "xxx"}
+        # This will have 2 vectors representing it
+        doc1 = {
+            # Omit key0 - check it doesn't raise an error
+            "key1": "xxx",
+            "key2": "yyy",
+            "key3": "zzz",
+        }
+        # This will have 3 vectors representing it
+        doc2 = {
+            "key0": "uuu",
+            "key1": "vvv",
+            "key2": "www",
+            "key3": "xxx",
+        }
         store.put(("test",), "doc1", doc1)
         store.put(("test",), "doc2", doc2)
 
+        # doc2.key3 and doc1.key1 both would have the highest score
         results = store.search(("test",), query="xxx")
         assert len(results) == 2
-        assert {results[0].key, results[1].key} == {"doc1", "doc2"}
+        assert results[0].key != results[1].key
+        ascore = results[0].score
+        bscore = results[1].score
+        assert ascore == pytest.approx(bscore, abs=1e-3)
 
+        # ~Only match doc2
         results = store.search(("test",), query="uuu")
         assert len(results) == 2
+        assert results[0].key != results[1].key
         assert results[0].key == "doc2"
+        assert results[0].score > results[1].score
+        assert ascore == pytest.approx(results[0].score, abs=1e-3)
 
+        # ~Only match doc1
         results = store.search(("test",), query="zzz")
         assert len(results) == 2
+        assert results[0].key != results[1].key
         assert results[0].key == "doc1"
+        assert results[0].score > results[1].score
+        assert ascore == pytest.approx(results[0].score, abs=1e-3)
+
+        # Un-indexed - will have low results for both. Not zero (because we're projecting)
+        # but less than the above.
+        results = store.search(("test",), query="www")
+        assert len(results) == 2
+        assert results[0].key != results[1].key
+        assert results[0].score < ascore
+        assert results[1].score < ascore
 
 
 def test_embed_with_path_operation_config(
@@ -543,21 +574,61 @@ def test_embed_with_path_operation_config(
     with _create_vector_store_with_text_fields(
         driver, "cos", fake_embeddings, text_fields=["key17"]
     ) as store:
-        doc3 = {"key0": "aaa", "key1": "bbb"}
-        doc4 = {"key0": "eee", "key1": "bbb"}
+        doc3 = {
+            "key0": "aaa",
+            "key1": "bbb",
+            "key2": "ccc",
+            "key3": "ddd",
+        }
+        doc4 = {
+            "key0": "eee",
+            "key1": "bbb",  # Same as doc3.key1
+            "key2": "fff",
+            "key3": "ggg",
+        }
 
         store.put(("test",), "doc3", doc3, index=["key0", "key1"])
-        store.put(("test",), "doc4", doc4, index=["key0"])
+        store.put(("test",), "doc4", doc4, index=["key1", "key3"])
 
         results = store.search(("test",), query="aaa")
         assert len(results) == 2
         assert results[0].key == "doc3"
+        assert len(set(r.key for r in results)) == 2
+        assert results[0].score > results[1].score
+
+        results = store.search(("test",), query="ggg")
+        assert len(results) == 2
+        assert results[0].key == "doc4"
+        assert results[0].score > results[1].score
 
         results = store.search(("test",), query="bbb")
         assert len(results) == 2
-        assert results[0].key == "doc3"
-        # doc4.key1 was not indexed, so it should have a lower score
-        assert results[0].score > results[1].score
+        assert results[0].key != results[1].key
+        assert results[0].score == pytest.approx(results[1].score, abs=1e-3)
+
+        results = store.search(("test",), query="ccc")
+        assert len(results) == 2
+        assert all(
+            r.score < 0.9 for r in results
+        )  # Unindexed field should have low scores
+
+        # Test index=False behavior
+        doc5 = {
+            "key0": "hhh",
+            "key1": "iii",
+        }
+        store.put(("test",), "doc5", doc5, index=False)
+        results = store.search(("test",))
+        assert len(results) == 3
+        assert all(r.score is None for r in results), f"{results}"
+        assert any(r.key == "doc5" for r in results)
+
+        results = store.search(("test",), query="hhh")
+        # TODO: We don't currently fill in additional results if there are not enough
+        # returned during vector search.
+        # assert len(results) == 3
+        # doc5_result = next(r for r in results if r.key == "doc5")
+        # assert doc5_result.score is None
 
 def _cosine_similarity(X: list[float], Y: list[list[float]]) -> list[float]:
     """

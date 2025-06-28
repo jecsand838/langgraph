@@ -379,9 +379,9 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
                     )
 
     async def _batch_put_ops(
-        self,
-        put_ops: Sequence[tuple[int, PutOp]],
-        tx: AsyncTransaction,
+            self,
+            put_ops: Sequence[tuple[int, PutOp]],
+            tx: AsyncTransaction,
     ) -> None:
         queries, embedding_request = self._prepare_batch_PUT_queries(put_ops)
 
@@ -400,7 +400,7 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
             text_to_vector = dict(zip(unique_texts, vectors))
 
             embedding_batch = [
-                {"prefix": ns, "key": k, "embedding": text_to_vector[text]}
+                {"prefix": ns, "key": k, "text": text, "embedding": text_to_vector[text]}
                 for (ns, k, text) in txt_params
             ]
 
@@ -549,7 +549,7 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
             await session.run("MATCH (n) DETACH DELETE n")
             try:
                 # Best effort to drop the index if it exists
-                await session.run("DROP INDEX vector_index")
+                await session.run("DROP INDEX ON :Embedding(embedding)")
             except Exception:
                 pass
 

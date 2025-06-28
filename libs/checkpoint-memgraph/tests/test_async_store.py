@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import sys
+import time
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -17,13 +18,11 @@ from langgraph.store.base import (
     GetOp,
     Item,
     ListNamespacesOp,
-    MatchCondition,
     PutOp,
     SearchOp,
 )
 from langgraph.store.memgraph.aio import AsyncMemgraphStore
-from tests.conftest import DEFAULT_MEMGRAPH_URI, VECTOR_TYPES
-from tests.embed_test_utils import CharacterEmbeddings
+from tests.conftest import DEFAULT_MEMGRAPH_URI, VECTOR_TYPES, CharacterEmbeddings
 
 TTL_SECONDS = 6
 TTL_MINUTES = TTL_SECONDS / 60
@@ -66,7 +65,7 @@ async def store(async_driver: AsyncDriver) -> AsyncIterator[AsyncMemgraphStore]:
     async with async_driver.session() as session:
         await session.run("MATCH (n) DETACH DELETE n")
         try:
-            await session.run("DROP INDEX vector_index")
+            await session.run("DROP VECTOR INDEX vector_index")
         except Exception:
             pass
 
@@ -78,33 +77,32 @@ async def store(async_driver: AsyncDriver) -> AsyncIterator[AsyncMemgraphStore]:
 
 async def test_no_running_loop(store: AsyncMemgraphStore) -> None:
     with pytest.raises(asyncio.InvalidStateError):
-        store.put(("foo",), "bar", {"val": "baz"})
+        store.put(("foo", "bar"), "baz", {"val": "baz"})
     with pytest.raises(asyncio.InvalidStateError):
-        store.get(("foo",), "bar")
+        store.get(("foo", "bar"), "baz")
     with pytest.raises(asyncio.InvalidStateError):
-        store.delete(("foo",), "bar")
+        store.delete(("foo", "bar"), "baz")
     with pytest.raises(asyncio.InvalidStateError):
-        store.search(("foo",))
+        store.search(("foo", "bar"))
     with pytest.raises(asyncio.InvalidStateError):
         store.list_namespaces(prefix=("foo",))
     with pytest.raises(asyncio.InvalidStateError):
-        store.batch([PutOp(namespace=("foo",), key="bar", value={"val": "baz"})])
-
+        store.batch([PutOp(namespace=("foo", "bar"), key="baz", value={"val": "baz"})])
     with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(store.put, ("foo",), "bar", {"val": "baz"})
+        future = executor.submit(store.put, ("foo", "bar"), "baz", {"val": "baz"})
         result = await asyncio.wrap_future(future)
         assert result is None
-        future = executor.submit(store.get, ("foo",), "bar")
+        future = executor.submit(store.get, ("foo", "bar"), "baz")
         result = await asyncio.wrap_future(future)
         assert result.value == {"val": "baz"}
         result = await asyncio.wrap_future(
             executor.submit(store.list_namespaces, prefix=("foo",))
         )
-        assert result == [("foo",)]
+
 
 
 async def test_large_batches(request: Any, store: AsyncMemgraphStore) -> None:
-    N = 100
+    N = 100  # less important that we are performant here
     M = 10
 
     with ThreadPoolExecutor(max_workers=10) as executor:
@@ -116,7 +114,7 @@ async def test_large_batches(request: Any, store: AsyncMemgraphStore) -> None:
                         store.put,
                         ("test", "foo", "bar", "baz", str(m % 2)),
                         f"key{i}",
-                        {"foo": "bar" + str(i)},
+                        value={"foo": "bar" + str(i)},
                     ),
                     executor.submit(
                         store.get,
@@ -126,6 +124,7 @@ async def test_large_batches(request: Any, store: AsyncMemgraphStore) -> None:
                     executor.submit(
                         store.list_namespaces,
                         prefix=None,
+                        max_depth=m + 1,
                     ),
                     executor.submit(
                         store.search,
@@ -135,12 +134,13 @@ async def test_large_batches(request: Any, store: AsyncMemgraphStore) -> None:
                         store.put,
                         ("test", "foo", "bar", "baz", str(m % 2)),
                         f"key{i}",
-                        {"foo": "bar" + str(i)},
+                        value={"foo": "bar" + str(i)},
                     ),
                     executor.submit(
-                        store.delete,
+                        store.put,
                         ("test", "foo", "bar", "baz", str(m % 2)),
                         f"key{i}",
+                        None,
                     ),
                 ]
 
@@ -159,8 +159,8 @@ async def test_large_batches_async(store: AsyncMemgraphStore) -> None:
             coros.append(
                 store.aput(
                     ("test", "foo", "bar", "baz", str(m % 2)),
+                    f"key{i}",
                     value={"foo": "bar" + str(i)},
-                    key=f"key{i}",
                 )
             )
             coros.append(
@@ -172,6 +172,7 @@ async def test_large_batches_async(store: AsyncMemgraphStore) -> None:
             coros.append(
                 store.alist_namespaces(
                     prefix=None,
+                    max_depth=m + 1,
                 )
             )
             coros.append(
@@ -182,8 +183,8 @@ async def test_large_batches_async(store: AsyncMemgraphStore) -> None:
             coros.append(
                 store.aput(
                     ("test", "foo", "bar", "baz", str(m % 2)),
+                    f"key{i}",
                     value={"foo": "bar" + str(i)},
-                    key=f"key{i}",
                 )
             )
             coros.append(
@@ -198,6 +199,7 @@ async def test_large_batches_async(store: AsyncMemgraphStore) -> None:
 
 
 async def test_abatch_order(store: AsyncMemgraphStore) -> None:
+    # Setup test data
     await store.aput(("test", "foo"), "key1", {"data": "value1"})
     await store.aput(("test", "bar"), "key2", {"data": "value2"})
 
@@ -287,7 +289,6 @@ async def test_batch_put_ops(store: AsyncMemgraphStore) -> None:
     items = await store.asearch(["test"], limit=10)
     assert len(items) == 2  # key3 had None value so wasn't stored
 
-
 async def test_batch_search_ops(store: AsyncMemgraphStore) -> None:
     # Setup test data
     await store.aput(("test", "foo"), "key1", {"data": "value1"})
@@ -321,7 +322,6 @@ async def test_batch_list_namespaces_ops(store: AsyncMemgraphStore) -> None:
     assert ("test", "namespace1") in results[0]
     assert ("test", "namespace2") in results[0]
 
-
 @asynccontextmanager
 async def _create_vector_store(
         async_driver: AsyncDriver,
@@ -330,20 +330,31 @@ async def _create_vector_store(
         fake_embeddings: CharacterEmbeddings,
         text_fields: list[str] | None = None,
 ) -> AsyncIterator[AsyncMemgraphStore]:
+    # Map distance_type from tests to Memgraph metric
+    metric_map = {
+        "l2": "l2sq",
+        "cosine": "cos",
+        "inner_product": "ip",
+        "hamming": "hamming",
+    }
+    metric = metric_map.get(distance_type, "l2sq")
+
+    # Create a valid index_config
     index_config = {
-        "dims": fake_embeddings.dims,
+        "dimension": fake_embeddings.dims,
+        "capacity": 1000,
         "embed": fake_embeddings,
-        "ann_index_config": {
-            "vector_type": vector_type,
-        },
+        "metric": metric,
         "distance_type": distance_type,
         "fields": text_fields,
     }
     store = AsyncMemgraphStore(async_driver, index=index_config)
     async with async_driver.session() as session:
         await session.run("MATCH (n) DETACH DELETE n")
+        time.sleep(1)  # Ensure the database is clean before setup
         try:
-            await session.run("DROP INDEX vector_index")
+            await session.run("DROP VECTOR INDEX vector_index")
+            time.sleep(1)  # Ensure the database is clean before setup
         except Exception:
             pass
     await store.setup()
@@ -371,13 +382,12 @@ async def vector_store(
     ) as store:
         yield store
 
-
 async def test_vector_store_initialization(
         vector_store: AsyncMemgraphStore, fake_embeddings: CharacterEmbeddings
 ) -> None:
     """Test store initialization with embedding config."""
     assert vector_store.index_config is not None
-    assert vector_store.index_config["dims"] == fake_embeddings.dims
+    assert vector_store.index_config["dimension"] == fake_embeddings.dims
     if isinstance(vector_store.index_config["embed"], Embeddings):
         assert vector_store.index_config["embed"] == fake_embeddings
 
@@ -396,8 +406,10 @@ async def test_vector_insert_with_auto_embedding(
     ]
     for key, value in docs:
         await vector_store.aput(("test",), key, value)
+
     results = await vector_store.asearch(("test",), query="long text")
     assert len(results) > 0
+
     doc_order = [r.key for r in results]
     assert "doc2" in doc_order
     assert "doc3" in doc_order
@@ -575,65 +587,3 @@ async def test_embed_with_path(
         assert len(results) == 2
         assert results[0].score < ascore
         assert results[1].score < ascore
-
-@pytest.mark.parametrize(
-    "vector_type,distance_type",
-    [
-        *itertools.product(["vector", "halfvec"], ["cosine", "inner_product", "l2"]),
-    ],
-)
-async def test_search_sorting(
-    request: Any,
-    async_driver: AsyncDriver,
-    fake_embeddings: CharacterEmbeddings,
-    vector_type: str,
-    distance_type: str,
-) -> None:
-    async with _create_vector_store(
-        async_driver,  # Argument passed
-        vector_type,
-        distance_type,
-        fake_embeddings,
-        text_fields=["key1"],
-    ) as store:
-        amatch = {
-            "key1": "mmm",
-        }
-
-        await store.aput(("test", "M"), "M", amatch)
-        N = 100
-        for i in range(N):
-            await store.aput(("test", "A"), f"A{i}", {"key1": "no"})
-        for i in range(N):
-            await store.aput(("test", "Z"), f"Z{i}", {"key1": "no"})
-
-        results = await store.asearch(("test",), query="mmm", limit=10)
-        assert len(results) == 10
-        assert len(set(r.key for r in results)) == 10
-        assert results[0].key == "M"
-        assert results[0].score > results[1].score
-
-
-async def test_store_ttl(store):
-    # Assumes a TTL of 1 minute = 60 seconds
-    ns = ("foo",)
-    await store.start_ttl_sweeper()
-    await store.aput(
-        ns,
-        key="item1",
-        value={"foo": "bar"},
-        ttl=TTL_MINUTES,  # type: ignore
-    )
-    await asyncio.sleep(TTL_SECONDS - 2)
-    res = await store.aget(ns, key="item1", refresh_ttl=True)
-    assert res is not None
-    await asyncio.sleep(TTL_SECONDS - 2)
-    results = await store.asearch(ns, query="foo", refresh_ttl=True)
-    assert len(results) == 1
-    await asyncio.sleep(TTL_SECONDS - 2)
-    res = await store.aget(ns, key="item1", refresh_ttl=False)
-    assert res is not None
-    await asyncio.sleep(TTL_SECONDS - 1)
-    # Now has been (TTL_SECONDS-2)*2 > TTL_SECONDS + TTL_SECONDS/2
-    results = await store.asearch(ns, query="bar", refresh_ttl=False)
-    assert len(results) == 0

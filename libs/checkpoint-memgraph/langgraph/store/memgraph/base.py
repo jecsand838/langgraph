@@ -98,7 +98,7 @@ VECTOR_MIGRATIONS: Sequence[Migration] = [
     Migration(
         # Vector index – all fields are injected via .format(**params)
         """
-CREATE VECTOR INDEX vector_index ON :StoreItem(embedding)
+CREATE VECTOR INDEX vector_index ON :Embedding(embedding)
 WITH CONFIG {{
     "dimension": {dimension},
     "capacity": {capacity},
@@ -246,7 +246,7 @@ RETURN n.key         AS key,
     # --------------------------------------------------------------------- #
 
     def _extract_texts_for_embedding(
-        self, inserts: list[PutOp]
+            self, inserts: list[PutOp]
     ) -> dict[tuple[str, str], list[str]]:
         """Collect texts that must be embedded according to index rules."""
         if not self.index_config:
@@ -272,7 +272,7 @@ RETURN n.key         AS key,
             for _, tokenized_path in paths_to_index:
                 texts = get_text_at_path(value, tokenized_path)
                 if texts:
-                    texts_by_node[(ns, k)].append(texts[0])
+                    texts_by_node[(ns, k)].extend(texts)
 
         return texts_by_node
 
@@ -281,22 +281,19 @@ RETURN n.key         AS key,
     # --------------------------------------------------------------------- #
 
     def _prepare_batch_PUT_queries(
-        self,
-        put_ops: Sequence[tuple[int, PutOp]],
-    ) -> tuple[
-        list[tuple[str, dict[str, Any]]],
-        tuple[str, Sequence[tuple[str, str, str]]] | None,
-    ]:
+            self,
+            put_ops: Sequence[tuple[int, PutOp]],
+        ) -> tuple[
+            list[tuple[str, dict[str, Any]]],
+            tuple[str, Sequence[tuple[str, str, str]]] | None,
+        ]:
         # Deduplicate ops → last one wins
         dedupped_ops: dict[tuple[tuple[str, ...], str], PutOp] = {
             (op.namespace, op.key): op for _, op in put_ops
         }
-
         inserts = [op for op in dedupped_ops.values() if op.value is not None]
         deletes = [op for op in dedupped_ops.values() if op.value is None]
-
         queries: list[tuple[str, dict[str, Any]]] = []
-
         # Deletes first --------------------------------------------------- #
         if deletes:
             delete_batch = [
@@ -313,7 +310,6 @@ DETACH DELETE n
                     {"batch": delete_batch},
                 )
             )
-
         # Inserts / updates ------------------------------------------------ #
         embedding_request: tuple[str, Sequence[tuple[str, str, str]]] | None = None
         if inserts:
@@ -332,13 +328,11 @@ DETACH DELETE n
                         if isinstance(v, (str, int, float, bool)):
                             props[k] = v
                 insert_batch.append(props)
-
             put_query = """
 UNWIND $batch AS op
 MERGE (n:StoreItem {prefix: op.prefix, key: op.key})
-WITH n, op, n.created_at AS created_at, n.embedding AS embedding
+WITH n, op, n.created_at AS created_at
 SET n            = op,
-    n.embedding  = embedding,
     n.created_at = COALESCE(created_at, localdatetime()),
     n.updated_at = localdatetime(),
     n.expires_at =
@@ -349,18 +343,30 @@ SET n            = op,
         END
 """
             queries.append((put_query, {"batch": insert_batch}))
-
+            # --- Clear Stale Embeddings --- #
+            queries.append(
+                (
+                """
+                UNWIND $batch AS op
+                MATCH (n:StoreItem {prefix: op.prefix, key: op.key})-[r:HAS_EMBEDDING]->(e:Embedding)
+                DELETE r, e
+                """,
+                {"batch": [{"prefix": _namespace_to_text(op.namespace), "key": op.key} for op in inserts]},
+                )
+            )
             # --- Embeddings ------------------------------------------------ #
             texts_by_node = self._extract_texts_for_embedding(inserts)
             if texts_by_node:
                 embedding_request_params = [
-                    (ns, k, " ".join(txts)) for (ns, k), txts in texts_by_node.items()
+                    (ns, k, text)
+                    for (ns, k), txts in texts_by_node.items()
+                    for text in txts
                 ]
-                embedding_request = (
-                    """
+                embedding_request = ("""
 UNWIND $batch AS op
 MATCH (n:StoreItem {prefix: op.prefix, key: op.key})
-SET n.embedding = op.embedding
+CREATE (e:Embedding {embedding: op.embedding, text: op.text})
+MERGE (n)-[:HAS_EMBEDDING]->(e)
 """,
                     embedding_request_params,
                 )
@@ -442,47 +448,43 @@ SET n.embedding = op.embedding
                     # Memgraph 'l2sq' distance = (L2 distance)^2. Test expects negative L2 distance.
                     score_expr = "-sqrt(distance)"
 
-                query_parts = [
-                    "CALL vector_search.search('vector_index', $k, $embedding)",
-                    "YIELD node AS n, distance",
-                    f"WITH n, {score_expr} AS score",
-                    where_stmt,
-                ]
-
+                final_projection = "WITH n, score"
                 if op.refresh_ttl:
-                    query_parts.append(
-                        """
-                        WITH n,
-                             score,
-                             CASE
+                    final_projection += """
+                    SET n.expires_at =
+                        CASE
                             WHEN n.ttl_minutes IS NOT NULL
                             THEN localdatetime() + duration({minute : n.ttl_minutes})
                             ELSE n.expires_at
                         END
-                        AS new_expires_at
-    SET n.expires_at = new_expires_at
-                        """
-                    )
+                    """
 
-                query_parts.extend(
-                    [
-                        """
-    RETURN n.prefix      AS prefix,
-           n.key         AS key,
-           n.value       AS value,
-           n.created_at  AS created_at,
-           n.updated_at  AS updated_at,
-           score
-    ORDER BY score DESC
-    SKIP $offset
-    """,
-                        limit_clause,
-                    ]
-                )
+                final_projection += """
+                RETURN n.prefix      AS prefix,
+                       n.key         AS key,
+                       n.value       AS value,
+                       n.created_at  AS created_at,
+                       n.updated_at  AS updated_at,
+                       score
+                """
+
+                query_parts = [
+                    "CALL vector_search.search('vector_index', $k, $embedding)",
+                    "YIELD node AS embedding_node, distance",
+                    "MATCH (n:StoreItem)-[:HAS_EMBEDDING]->(embedding_node)",
+                    f"WITH n, {score_expr} AS score",
+                    where_stmt,
+                    # Dedupe by parent node, taking the max score
+                    "WITH n, max(score) as score",
+                    "ORDER BY score DESC",
+                    "SKIP $offset",
+                    limit_clause,
+                    final_projection,
+                ]
 
                 queries.append(
                     (
-                        "\n".join(query_parts),
+                        "\n".join([p for p in query_parts if p]),
                         {
                             **params,
                             "k": op.limit + op.offset if op.limit is not None else 10,
@@ -813,9 +815,9 @@ RETURN count(n) as deleted_count
                     results[idx] = _record_to_item(namespace, rec, loader=self._deserializer)
 
     def _batch_put_ops(
-        self,
-        put_ops: Sequence[tuple[int, PutOp]],
-        tx: Transaction,
+            self,
+            put_ops: Sequence[tuple[int, PutOp]],
+            tx: Transaction,
     ) -> None:
         queries, embedding_req = self._prepare_batch_PUT_queries(put_ops)
         for q, p in queries:
@@ -828,7 +830,7 @@ RETURN count(n) as deleted_count
             texts = sorted({t for _, _, t in txt_params})
             vectors = self.embeddings.embed_documents(texts)
             t2v = dict(zip(texts, vectors))
-            batch = [{"prefix": ns, "key": k, "embedding": t2v[text]} for ns, k, text in txt_params]
+            batch = [{"prefix": ns, "key": k, "text": text, "embedding": t2v[text]} for ns, k, text in txt_params]
             tx.run(q, {"batch": batch})
 
     def _batch_search_ops(
