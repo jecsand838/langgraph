@@ -3,7 +3,7 @@
 import math
 import random
 from collections import Counter, defaultdict
-from typing import Any, List
+from typing import Any
 
 from langchain_core.embeddings import Embeddings
 
@@ -15,14 +15,14 @@ class CharacterEmbeddings(Embeddings):
         """Initialize with embedding dimensions and random seed."""
         self._rng = random.Random(seed)
         self.dims = dims
-        # Create projection vector for each character lazily
-        self._char_projections: defaultdict[str, List[float]] = defaultdict(
+        # Create a projection vector for each character lazily
+        self._char_projections: defaultdict[str, list[float]] = defaultdict(
             lambda: [
                 self._rng.gauss(0, 1 / math.sqrt(self.dims)) for _ in range(self.dims)
             ]
         )
 
-    def _embed_one(self, text: str) -> List[float]:
+    def _embed_one(self, text: str) -> list[float]:
         """Embed a single text."""
         counts = Counter(text)
         total = sum(counts.values())
@@ -43,11 +43,11 @@ class CharacterEmbeddings(Embeddings):
 
         return embedding
 
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
         """Embed a list of documents."""
         return [self._embed_one(text) for text in texts]
 
-    def embed_query(self, text: str) -> List[float]:
+    def embed_query(self, text: str) -> list[float]:
         """Embed a query string."""
         return self._embed_one(text)
 

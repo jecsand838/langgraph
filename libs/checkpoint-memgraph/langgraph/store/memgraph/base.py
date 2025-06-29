@@ -81,7 +81,7 @@ class Migration(NamedTuple):
 
     cypher: str
     params: dict[str, Any] | None = None
-    condition: Callable[["BaseMemgraphStore"], bool] | None = None
+    condition: Callable[[BaseMemgraphStore], bool] | None = None
 
 
 MIGRATIONS: Sequence[str] = [
@@ -195,14 +195,14 @@ class BaseMemgraphStore(Generic[C]):
         results: list[tuple[str, dict, tuple[str, ...], list]] = []
         for namespace, items in namespace_groups.items():
             ns_text = _namespace_to_text(namespace)
-            query = f"""
+            query = """
 UNWIND $items AS item
-MATCH (n:StoreItem {{prefix: $prefix, key: item.key}})
+MATCH (n:StoreItem {prefix: $prefix, key: item.key})
 WHERE (n.expires_at IS NULL OR n.expires_at >= localdatetime())
 WITH n, item,
      CASE
          WHEN item.refresh_ttl AND n.ttl_minutes IS NOT NULL
-         THEN localdatetime() + duration({{minute: n.ttl_minutes}})
+         THEN localdatetime() + duration({minute: n.ttl_minutes})
          ELSE n.expires_at
      END AS new_expires_at
 SET n.expires_at = new_expires_at
@@ -564,7 +564,7 @@ class MemgraphStore(BaseStore, BaseMemgraphStore[Driver]):
         database: str = "memgraph",
         index: MemgraphIndexConfig | None = None,
         ttl: TTLConfig | None = None,
-    ) -> Iterator["MemgraphStore"]:
+    ) -> Iterator[MemgraphStore]:
         """Create a store from a Memgraph connection URI."""
         parsed = urlparse(conn_string)
         uri = f"{parsed.scheme}://{parsed.hostname}:{parsed.port or 7687}"

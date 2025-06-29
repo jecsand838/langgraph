@@ -4,7 +4,7 @@ import asyncio
 from collections import defaultdict
 from collections.abc import AsyncIterator, Iterator, Sequence
 from contextlib import asynccontextmanager
-from typing import Any, Dict
+from typing import Any
 
 from langchain_core.runnables import RunnableConfig
 from neo4j import AsyncDriver, AsyncGraphDatabase, AsyncTransaction
@@ -22,6 +22,22 @@ from langgraph.checkpoint.serde.base import SerializerProtocol
 from langgraph.checkpoint.serde.types import TASKS
 
 from .base import BaseMemgraphSaver
+
+try:
+    # Available in Python 3.10+
+    from builtins import anext
+except ImportError:
+    # Custom implementation for Python 3.9
+    _sentinel = object()
+
+    async def anext(iterator, default=_sentinel):
+        """A backport of anext() for Python < 3.10."""
+        try:
+            return await iterator.__anext__()
+        except StopAsyncIteration:
+            if default is _sentinel:
+                raise
+            return default
 
 
 class AsyncMemgraphSaver(BaseMemgraphSaver):
@@ -330,7 +346,7 @@ class AsyncMemgraphSaver(BaseMemgraphSaver):
             finally:
                 await session.close()
 
-    async def _load_checkpoint_tuple(self, record: Dict[str, Any]) -> CheckpointTuple:
+    async def _load_checkpoint_tuple(self, record: dict[str, Any]) -> CheckpointTuple:
         """
         Convert a database record into a CheckpointTuple asynchronously.
 

@@ -4,10 +4,10 @@ import asyncio
 import itertools
 import sys
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from typing import Any, AsyncGenerator
+from typing import Any
 from urllib.parse import unquote, urlparse
 
 import pytest
@@ -22,7 +22,11 @@ from langgraph.store.base import (
     SearchOp,
 )
 from langgraph.store.memgraph.aio import AsyncMemgraphStore
-from tests.conftest import DEFAULT_MEMGRAPH_URI, VECTOR_TYPES, CharacterEmbeddings
+from tests.conftest import (
+    DEFAULT_MEMGRAPH_URI,
+    VECTOR_TYPES,
+    CharacterEmbeddings,
+)
 
 TTL_SECONDS = 6
 TTL_MINUTES = TTL_SECONDS / 60

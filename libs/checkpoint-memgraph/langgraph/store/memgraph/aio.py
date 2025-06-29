@@ -352,7 +352,7 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
                             text
                         )
 
-        for i, (op_idx, op) in enumerate(search_ops):
+        for i, (op_idx, _op) in enumerate(search_ops):
             if i >= len(queries):
                 continue
             query, params = queries[i]
@@ -392,8 +392,8 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
 
         async def _get_version(tx: AsyncTransaction, table: str) -> int:
             result = await tx.run(
-                f"""
-                MERGE (m:Migration {{name: $table}})
+                """
+                MERGE (m:Migration {name: $table})
                 ON CREATE SET m.version = -1
                 RETURN m.version AS v
                 """,

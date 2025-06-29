@@ -4,7 +4,7 @@ import threading
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from typing import Any, Dict
+from typing import Any
 
 from langchain_core.runnables import RunnableConfig
 from neo4j import Driver, GraphDatabase, Transaction
@@ -305,7 +305,7 @@ class MemgraphSaver(BaseMemgraphSaver):
             with session.begin_transaction() as tx:
                 yield tx
 
-    def _load_checkpoint_tuple(self, record: Dict[str, Any]) -> CheckpointTuple:
+    def _load_checkpoint_tuple(self, record: dict[str, Any]) -> CheckpointTuple:
         """
         Convert a database record into a CheckpointTuple.
 
