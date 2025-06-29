@@ -6,9 +6,8 @@ from collections.abc import AsyncIterator, Iterator, Sequence
 from contextlib import asynccontextmanager
 from typing import Any, Dict
 
-from neo4j import AsyncDriver, AsyncGraphDatabase, AsyncTransaction
-
 from langchain_core.runnables import RunnableConfig
+from neo4j import AsyncDriver, AsyncGraphDatabase, AsyncTransaction
 
 from langgraph.checkpoint.base import (
     WRITES_IDX_MAP,
@@ -186,7 +185,10 @@ class AsyncMemgraphSaver(BaseMemgraphSaver):
             if record is None:
                 return None
             record_dict = dict(record)
-            if record_dict["checkpoint"].get("v", 0) < 4 and record_dict["parent_checkpoint_id"]:
+            if (
+                record_dict["checkpoint"].get("v", 0) < 4
+                and record_dict["parent_checkpoint_id"]
+            ):
                 thread_id = config["configurable"]["thread_id"]
                 sends_result = await tx.run(
                     self.SELECT_PENDING_SENDS_CYPHER,
@@ -327,7 +329,6 @@ class AsyncMemgraphSaver(BaseMemgraphSaver):
                     yield tx
             finally:
                 await session.close()
-
 
     async def _load_checkpoint_tuple(self, record: Dict[str, Any]) -> CheckpointTuple:
         """

@@ -163,6 +163,7 @@ CREATE (w:Write {
 MERGE (c)-[:HAS_WRITE]->(w)
 """
 
+
 class BaseMemgraphSaver(BaseCheckpointSaver[str]):
     """Common implementation used by both the sync and async savers."""
 
@@ -247,7 +248,9 @@ class BaseMemgraphSaver(BaseCheckpointSaver[str]):
         blobs: list[dict[str, Any]] = []
         for channel, version in versions.items():
             type_, blob = (
-                self.serde.dumps_typed(values[channel]) if channel in values else ("empty", None)
+                self.serde.dumps_typed(values[channel])
+                if channel in values
+                else ("empty", None)
             )
             blob = self._encode_blob(blob)
             blobs.append(
@@ -269,7 +272,11 @@ class BaseMemgraphSaver(BaseCheckpointSaver[str]):
         """Decode Write node rows."""
         return (
             [
-                (task_id, channel, self.serde.loads_typed((type_, self._decode_blob(blob))))
+                (
+                    task_id,
+                    channel,
+                    self.serde.loads_typed((type_, self._decode_blob(blob))),
+                )
                 for task_id, channel, type_, blob in writes
             ]
             if writes

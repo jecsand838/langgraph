@@ -1,8 +1,8 @@
-import pytest
 from contextlib import asynccontextmanager
 from typing import Any
 from urllib.parse import unquote, urlparse
 
+import pytest
 from langchain_core.runnables import RunnableConfig
 from neo4j import AsyncGraphDatabase
 
@@ -158,9 +158,13 @@ async def test_alist(saver: AsyncMemgraphSaver, test_data) -> None:
     assert len(search_results_4) == 0
 
     # Test search by config (thread_id)
-    search_results_5 = [c async for c in saver.alist({"configurable": {"thread_id": "thread-2"}})]
+    search_results_5 = [
+        c async for c in saver.alist({"configurable": {"thread_id": "thread-2"}})
+    ]
     assert len(search_results_5) == 2
-    checkpoint_ns_set = {res.config["configurable"]["checkpoint_ns"] for res in search_results_5}
+    checkpoint_ns_set = {
+        res.config["configurable"]["checkpoint_ns"] for res in search_results_5
+    }
     assert checkpoint_ns_set == {"", "inner"}
 
 
@@ -178,7 +182,9 @@ async def test_pending_sends_migration(saver: AsyncMemgraphSaver) -> None:
     config = await saver.aput(config, checkpoint_0, {}, {})
 
     # Put some pending sends linked to the first checkpoint
-    await saver.aput_writes(config, [(TASKS, "send-1"), (TASKS, "send-2")], task_id="task-1")
+    await saver.aput_writes(
+        config, [(TASKS, "send-1"), (TASKS, "send-2")], task_id="task-1"
+    )
     await saver.aput_writes(config, [(TASKS, "send-3")], task_id="task-2")
 
     # Check that fetching checkpoint_0 directly shows no channel values
@@ -204,17 +210,23 @@ async def test_pending_sends_migration(saver: AsyncMemgraphSaver) -> None:
     assert TASKS in tuple_1.checkpoint["channel_versions"]
 
     # Check that listing checkpoints also applies the migration correctly
-    search_results = [c async for c in saver.alist({"configurable": {"thread_id": "thread-1"}})]
+    search_results = [
+        c async for c in saver.alist({"configurable": {"thread_id": "thread-1"}})
+    ]
     assert len(search_results) == 2
 
     # The newer checkpoint (checkpoint_1) should have the migrated sends
-    assert search_results[0].config["configurable"]["checkpoint_id"] == checkpoint_1["id"]
+    assert (
+        search_results[0].config["configurable"]["checkpoint_id"] == checkpoint_1["id"]
+    )
     assert search_results[0].checkpoint["channel_values"] == {
         TASKS: ["send-1", "send-2", "send-3"]
     }
     assert TASKS in search_results[0].checkpoint["channel_versions"]
 
     # The older checkpoint (checkpoint_0) should not have them
-    assert search_results[1].config["configurable"]["checkpoint_id"] == checkpoint_0["id"]
+    assert (
+        search_results[1].config["configurable"]["checkpoint_id"] == checkpoint_0["id"]
+    )
     assert search_results[1].checkpoint["channel_values"] == {}
     assert search_results[1].checkpoint["channel_versions"] == {}

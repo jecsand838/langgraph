@@ -6,9 +6,8 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from typing import Any, Dict
 
-from neo4j import Driver, GraphDatabase, Transaction
-
 from langchain_core.runnables import RunnableConfig
+from neo4j import Driver, GraphDatabase, Transaction
 
 from langgraph.checkpoint.base import (
     WRITES_IDX_MAP,
@@ -113,7 +112,7 @@ class MemgraphSaver(BaseMemgraphSaver):
         if limit:
             query += f" LIMIT {limit}"
         with self._session() as tx:
-            records = [dict(r) for r in tx.run(query, params)] # type: ignore
+            records = [dict(r) for r in tx.run(query, params)]  # type: ignore
             if not records:
                 return
             to_migrate = [
@@ -124,14 +123,16 @@ class MemgraphSaver(BaseMemgraphSaver):
             if to_migrate:
                 thread_id = records[0]["thread_id"]
                 parent_ids = list({r["parent_checkpoint_id"] for r in to_migrate})
-                sends_records = list(tx.run(
-                    self.SELECT_PENDING_SENDS_CYPHER,
-                    {
-                        "thread_id": thread_id,
-                        "checkpoint_ids": parent_ids,
-                        "tasks_channel": TASKS,
-                    },
-                ))
+                sends_records = list(
+                    tx.run(
+                        self.SELECT_PENDING_SENDS_CYPHER,
+                        {
+                            "thread_id": thread_id,
+                            "checkpoint_ids": parent_ids,
+                            "tasks_channel": TASKS,
+                        },
+                    )
+                )
                 grouped_by_parent = defaultdict(list)
                 for record in to_migrate:
                     grouped_by_parent[record["parent_checkpoint_id"]].append(record)
@@ -168,7 +169,7 @@ class MemgraphSaver(BaseMemgraphSaver):
         if "checkpoint_id" not in config["configurable"]:
             query += " ORDER BY c.checkpoint_id DESC LIMIT 1"
         with self._session() as tx:
-            result = tx.run(query, params).single() # type: ignore
+            result = tx.run(query, params).single()  # type: ignore
             if result is None:
                 return None
             record = dict(result)

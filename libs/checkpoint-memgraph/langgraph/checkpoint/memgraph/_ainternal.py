@@ -8,7 +8,6 @@ from typing import Union
 
 from neo4j import AsyncDriver, AsyncSession
 
-
 Conn = Union[AsyncDriver, AsyncSession]
 
 

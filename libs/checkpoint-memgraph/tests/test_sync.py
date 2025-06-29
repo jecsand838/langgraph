@@ -234,13 +234,17 @@ def test_pending_sends_migration(saver: MemgraphSaver) -> None:
     assert len(search_results) == 2
 
     # The newer checkpoint (checkpoint_1) should have the migrated sends
-    assert search_results[0].config["configurable"]["checkpoint_id"] == checkpoint_1["id"]
+    assert (
+        search_results[0].config["configurable"]["checkpoint_id"] == checkpoint_1["id"]
+    )
     assert search_results[0].checkpoint["channel_values"] == {
         TASKS: ["send-1", "send-2", "send-3"]
     }
     assert TASKS in search_results[0].checkpoint["channel_versions"]
 
     # The older checkpoint (checkpoint_0) should not have them
-    assert search_results[1].config["configurable"]["checkpoint_id"] == checkpoint_0["id"]
+    assert (
+        search_results[1].config["configurable"]["checkpoint_id"] == checkpoint_0["id"]
+    )
     assert search_results[1].checkpoint["channel_values"] == {}
     assert search_results[1].checkpoint["channel_versions"] == {}

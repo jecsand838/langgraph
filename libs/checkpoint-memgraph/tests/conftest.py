@@ -5,6 +5,7 @@ Ensures that the library root (two levels up) is on the import path so that
 `import langgraph.checkpoint.memgraph` resolves when the package has not been
 installed into the active environment.
 """
+
 from __future__ import annotations
 
 from collections.abc import Iterator
@@ -38,5 +39,6 @@ def clear_test_db(conn: Session) -> None:
 @pytest.fixture
 def fake_embeddings() -> CharacterEmbeddings:
     return CharacterEmbeddings(dims=500)
+
 
 VECTOR_TYPES = ["vector", "halfvec"]

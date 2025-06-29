@@ -150,13 +150,13 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
             yield session
 
     @asynccontextmanager
-    async def _transaction(self, session: AsyncSession) -> AsyncIterator[AsyncTransaction]:
+    async def _transaction(
+        self, session: AsyncSession
+    ) -> AsyncIterator[AsyncTransaction]:
         async with await session.begin_transaction() as tx:
             yield tx
 
-    def _build_search_where_clause(
-        self, op: SearchOp, params: dict[str, Any]
-    ) -> str:
+    def _build_search_where_clause(self, op: SearchOp, params: dict[str, Any]) -> str:
         where_clauses = ["(n.expires_at IS NULL OR n.expires_at >= localdatetime())"]
 
         if op.namespace_prefix is not None:
@@ -206,7 +206,9 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
                 "offset": op.offset,
                 "max_depth": op.max_depth,
             }
-            match_clauses = ["(n.expires_at IS NULL OR n.expires_at >= localdatetime())"]
+            match_clauses = [
+                "(n.expires_at IS NULL OR n.expires_at >= localdatetime())"
+            ]
             if op.match_conditions:
                 for i, condition in enumerate(op.match_conditions):
                     path_param = f"path_{i}"
@@ -297,9 +299,9 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
                     )
 
     async def _batch_put_ops(
-            self,
-            put_ops: Sequence[tuple[int, PutOp]],
-            tx: AsyncTransaction,
+        self,
+        put_ops: Sequence[tuple[int, PutOp]],
+        tx: AsyncTransaction,
     ) -> None:
         queries, embedding_request = self._prepare_batch_PUT_queries(put_ops)
         for query, params in queries:
@@ -314,16 +316,21 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
             vectors = await self.embeddings.aembed_documents(unique_texts)
             text_to_vector = dict(zip(unique_texts, vectors))
             embedding_batch = [
-                {"prefix": ns, "key": k, "text": text, "embedding": text_to_vector[text]}
+                {
+                    "prefix": ns,
+                    "key": k,
+                    "text": text,
+                    "embedding": text_to_vector[text],
+                }
                 for (ns, k, text) in txt_params
             ]
             await tx.run(query, {"batch": embedding_batch})
 
     async def _batch_search_ops(
-            self,
-            search_ops: Sequence[tuple[int, SearchOp]],
-            results: list[Result],
-            tx: AsyncTransaction,
+        self,
+        search_ops: Sequence[tuple[int, SearchOp]],
+        results: list[Result],
+        tx: AsyncTransaction,
     ) -> None:
         queries, embedding_requests = self._prepare_batch_search_queries(search_ops)
         op_idxs_requiring_embedding = {
@@ -341,7 +348,9 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
                 text_to_embedding = dict(zip(unique_texts, embeddings))
                 for op_idx, text in embedding_requests:
                     if text and op_idx in op_idx_to_params:
-                        op_idx_to_params[op_idx]["embedding"] = text_to_embedding.get(text)
+                        op_idx_to_params[op_idx]["embedding"] = text_to_embedding.get(
+                            text
+                        )
 
         for i, (op_idx, op) in enumerate(search_ops):
             if i >= len(queries):
@@ -518,6 +527,7 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
                     break
                 except Exception as exc:
                     logger.exception("Store TTL sweep iteration failed", exc_info=exc)
+
         task = asyncio.create_task(_sweep_loop())
         task.set_name("ttl-sweeper")
         self._ttl_sweeper_task = task

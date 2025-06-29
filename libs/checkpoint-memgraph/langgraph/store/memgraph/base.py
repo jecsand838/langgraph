@@ -26,6 +26,7 @@ Key additions in this version
 Nothing else in the public interface changed – the store continues to satisfy
 all contracts defined by ``BaseStore`` and mirrors ``PostgresStore`` semantics.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -74,6 +75,7 @@ if TYPE_CHECKING:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
+
 class Migration(NamedTuple):
     """A database migration with optional conditions and parameters."""
 
@@ -107,6 +109,7 @@ WITH CONFIG {{
         },
     ),
 ]
+
 
 class MemgraphIndexConfig(IndexConfig, total=False):
     """Configuration for Memgraph vector indexing.
@@ -142,9 +145,17 @@ class MemgraphIndexConfig(IndexConfig, total=False):
 def _normalise_index_config(cfg: MemgraphIndexConfig) -> MemgraphIndexConfig:
     """Validate & enrich the user‑supplied index config."""
     cfg = cfg.copy()  # we never mutate the caller's object
-    if "dimension" not in cfg or not isinstance(cfg["dimension"], int) or cfg["dimension"] <= 0:
+    if (
+        "dimension" not in cfg
+        or not isinstance(cfg["dimension"], int)
+        or cfg["dimension"] <= 0
+    ):
         raise ValueError("MemgraphIndexConfig: 'dimension' (positive int) is required")
-    if "capacity" not in cfg or not isinstance(cfg["capacity"], int) or cfg["capacity"] <= 0:
+    if (
+        "capacity" not in cfg
+        or not isinstance(cfg["capacity"], int)
+        or cfg["capacity"] <= 0
+    ):
         raise ValueError("MemgraphIndexConfig: 'capacity' (positive int) is required")
     cfg.setdefault("metric", "l2sq")
     cfg.setdefault("resize_coefficient", 2)
@@ -157,6 +168,7 @@ def _normalise_index_config(cfg: MemgraphIndexConfig) -> MemgraphIndexConfig:
         else:  # treat everything else as some form of L2
             cfg["distance_type"] = "l2"
     return cfg
+
 
 C = TypeVar("C", bound=Union[Driver])
 
@@ -205,7 +217,7 @@ RETURN n.key         AS key,
         return results
 
     def _extract_texts_for_embedding(
-            self, inserts: list[PutOp]
+        self, inserts: list[PutOp]
     ) -> dict[tuple[str, str], list[str]]:
         """Collect texts that must be embedded according to index rules."""
         if not self.index_config:
@@ -230,12 +242,12 @@ RETURN n.key         AS key,
         return texts_by_node
 
     def _prepare_batch_PUT_queries(
-            self,
-            put_ops: Sequence[tuple[int, PutOp]],
-        ) -> tuple[
-            list[tuple[str, dict[str, Any]]],
-            tuple[str, Sequence[tuple[str, str, str]]] | None,
-        ]:
+        self,
+        put_ops: Sequence[tuple[int, PutOp]],
+    ) -> tuple[
+        list[tuple[str, dict[str, Any]]],
+        tuple[str, Sequence[tuple[str, str, str]]] | None,
+    ]:
         dedupped_ops: dict[tuple[tuple[str, ...], str], PutOp] = {
             (op.namespace, op.key): op for _, op in put_ops
         }
@@ -289,12 +301,17 @@ SET n            = op,
             queries.append((put_query, {"batch": insert_batch}))
             queries.append(
                 (
-                """
+                    """
                 UNWIND $batch AS op
                 MATCH (n:StoreItem {prefix: op.prefix, key: op.key})-[r:HAS_EMBEDDING]->(e:Embedding)
                 DELETE r, e
                 """,
-                {"batch": [{"prefix": _namespace_to_text(op.namespace), "key": op.key} for op in inserts]},
+                    {
+                        "batch": [
+                            {"prefix": _namespace_to_text(op.namespace), "key": op.key}
+                            for op in inserts
+                        ]
+                    },
                 )
             )
             texts_by_node = self._extract_texts_for_embedding(inserts)
@@ -304,7 +321,8 @@ SET n            = op,
                     for (ns, k), txts in texts_by_node.items()
                     for text in txts
                 ]
-                embedding_request = ("""
+                embedding_request = (
+                    """
 UNWIND $batch AS op
 MATCH (n:StoreItem {prefix: op.prefix, key: op.key})
 CREATE (e:Embedding {embedding: op.embedding, text: op.text})
@@ -328,12 +346,12 @@ MERGE (n)-[:HAS_EMBEDDING]->(e)
                     for op_key, op_val in value.items():
                         pname = f"filter_val_{i}"
                         clause = {
-                            "$gt":  ">",
+                            "$gt": ">",
                             "$gte": ">=",
-                            "$lt":  "<",
+                            "$lt": "<",
                             "$lte": "<=",
-                            "$ne":  "<>",
-                            "$eq":  "=",
+                            "$ne": "<>",
+                            "$eq": "=",
                         }.get(op_key)
                         if clause is None:
                             logger.warning("Unsupported filter operator %s", op_key)
@@ -349,8 +367,8 @@ MERGE (n)-[:HAS_EMBEDDING]->(e)
         return f"WHERE {' AND '.join(where)}" if where else ""
 
     def _prepare_batch_search_queries(
-            self,
-            search_ops: Sequence[tuple[int, SearchOp]],
+        self,
+        search_ops: Sequence[tuple[int, SearchOp]],
     ) -> tuple[list[tuple[str, dict[str, Any]]], list[tuple[int, str]]]:
         queries: list[tuple[str, dict[str, Any]]] = []
         embedding_requests: list[tuple[int, str]] = []
@@ -364,9 +382,11 @@ MERGE (n)-[:HAS_EMBEDDING]->(e)
                 params["limit"] = op.limit
             if op.query and self.index_config:
                 embedding_requests.append((idx, op.query))
-                dist_type = cast(MemgraphIndexConfig, self.index_config).get(
-                    "distance_type", "cosine"
-                ).lower()
+                dist_type = (
+                    cast(MemgraphIndexConfig, self.index_config)
+                    .get("distance_type", "cosine")
+                    .lower()
+                )
                 if dist_type == "cosine" or dist_type == "inner_product":
                     # For normalized vectors, as used in this test suite, Memgraph's
                     # COSINE and INNER_PRODUCT distances are both calculated as (1 - similarity).
@@ -495,6 +515,7 @@ SKIP $offset
             "Filtering on JSON content is not supported in the Memgraph store."
         )
 
+
 class MemgraphStore(BaseStore, BaseMemgraphStore[Driver]):
     """Synchronous Memgraph store."""
 
@@ -582,9 +603,7 @@ RETURN count(n) as deleted_count
             return fut
         self._ttl_stop_event.clear()
         interval = float(
-            sweep_interval_minutes
-            or self.ttl_config.get("sweep_interval_minutes")
-            or 5
+            sweep_interval_minutes or self.ttl_config.get("sweep_interval_minutes") or 5
         )
         logger.info("Starting TTL sweeper (interval=%smin)", interval)
         future = concurrent.futures.Future()
@@ -646,7 +665,9 @@ RETURN count(n) as deleted_count
         results: list[Result] = [None] * total
         with self._session() as session, self._transaction(session) as tx:
             if PutOp in grouped:
-                self._batch_put_ops(cast(Sequence[tuple[int, PutOp]], grouped[PutOp]), tx)
+                self._batch_put_ops(
+                    cast(Sequence[tuple[int, PutOp]], grouped[PutOp]), tx
+                )
             if GetOp in grouped:
                 self._batch_get_ops(
                     cast(Sequence[tuple[int, GetOp]], grouped[GetOp]), results, tx
@@ -657,7 +678,10 @@ RETURN count(n) as deleted_count
                 )
             if ListNamespacesOp in grouped:
                 self._batch_list_namespaces_ops(
-                    cast(Sequence[tuple[int, ListNamespacesOp]], grouped[ListNamespacesOp]),
+                    cast(
+                        Sequence[tuple[int, ListNamespacesOp]],
+                        grouped[ListNamespacesOp],
+                    ),
                     results,
                     tx,
                 )
@@ -677,12 +701,14 @@ RETURN count(n) as deleted_count
             for rec in tx.run(query, params):
                 idx = {i["key"]: i["idx"] for i in items}.get(rec["key"])
                 if idx is not None:
-                    results[idx] = _record_to_item(namespace, rec, loader=self._deserializer)
+                    results[idx] = _record_to_item(
+                        namespace, rec, loader=self._deserializer
+                    )
 
     def _batch_put_ops(
-            self,
-            put_ops: Sequence[tuple[int, PutOp]],
-            tx: Transaction,
+        self,
+        put_ops: Sequence[tuple[int, PutOp]],
+        tx: Transaction,
     ) -> None:
         queries, embedding_req = self._prepare_batch_PUT_queries(put_ops)
         for q, p in queries:
@@ -694,7 +720,10 @@ RETURN count(n) as deleted_count
             texts = sorted({t for _, _, t in txt_params})
             vectors = self.embeddings.embed_documents(texts)
             t2v = dict(zip(texts, vectors))
-            batch = [{"prefix": ns, "key": k, "text": text, "embedding": t2v[text]} for ns, k, text in txt_params]
+            batch = [
+                {"prefix": ns, "key": k, "text": text, "embedding": t2v[text]}
+                for ns, k, text in txt_params
+            ]
             tx.run(q, {"batch": batch})
 
     def _batch_search_ops(
@@ -704,7 +733,9 @@ RETURN count(n) as deleted_count
         tx: Transaction,
     ) -> None:
         queries, embedding_reqs = self._prepare_batch_search_queries(search_ops)
-        op_idx_to_params = {op_idx: queries[i][1] for i, (op_idx, _) in enumerate(search_ops)}
+        op_idx_to_params = {
+            op_idx: queries[i][1] for i, (op_idx, _) in enumerate(search_ops)
+        }
         if embedding_reqs and self.embeddings:
             texts = sorted({t for _, t in embedding_reqs if t})
             embeddings = self.embeddings.embed_documents(texts)
@@ -736,7 +767,9 @@ RETURN count(n) as deleted_count
         ):
             rows = tx.run(query, params)
             results[idx] = [
-                _decode_ns_text(r["truncated_prefix"]) for r in rows if r["truncated_prefix"]
+                _decode_ns_text(r["truncated_prefix"])
+                for r in rows
+                if r["truncated_prefix"]
             ]
 
     def setup(self) -> None:
@@ -761,6 +794,7 @@ SET m.version = $v
 """,
                 {"table": table, "v": v},
             )
+
         with self._session() as session:
             with session.begin_transaction() as tx:
                 ver = _get_version(tx, "store_migrations")
@@ -774,12 +808,16 @@ SET m.version = $v
                         with session.begin_transaction() as tx:
                             _set_version(tx, "store_migrations", v)
                     else:
-                        logger.error("Failed migration%s\nCypher:%s\nErr:%s", v, cypher, e)
+                        logger.error(
+                            "Failed migration%s\nCypher:%s\nErr:%s", v, cypher, e
+                        )
                         raise
             if self.index_config:
                 with session.begin_transaction() as tx:
                     ver = _get_version(tx, "vector_migrations")
-                for v, mig in enumerate(self.VECTOR_MIGRATIONS[ver + 1 :], start=ver + 1):
+                for v, mig in enumerate(
+                    self.VECTOR_MIGRATIONS[ver + 1 :], start=ver + 1
+                ):
                     if mig.condition and not mig.condition(self):
                         continue
                     params = {
@@ -796,8 +834,14 @@ SET m.version = $v
                             with session.begin_transaction() as tx:
                                 _set_version(tx, "vector_migrations", v)
                         else:
-                            logger.error("Vector migration %s failed\nCypher:%s\nErr:%s", v, cypher, e)
+                            logger.error(
+                                "Vector migration %s failed\nCypher:%s\nErr:%s",
+                                v,
+                                cypher,
+                                e,
+                            )
                             raise
+
 
 class Record(TypedDict):
     key: str
@@ -832,6 +876,7 @@ def _record_to_item(
         updated_at=record["updated_at"].to_native(),
     )
 
+
 def _record_to_search_item(
     namespace: tuple[str, ...],
     record: Record,
@@ -851,6 +896,7 @@ def _record_to_search_item(
         score=float(score) if score is not None else None,
     )
 
+
 def _group_ops(ops: Iterable[Op]) -> tuple[dict[type, list[tuple[int, Op]]], int]:
     groups: dict[type, list[tuple[int, Op]]] = defaultdict(list)
     total = 0
@@ -858,6 +904,7 @@ def _group_ops(ops: Iterable[Op]) -> tuple[dict[type, list[tuple[int, Op]]], int
         groups[type(op)].append((idx, op))
         total += 1
     return groups, total
+
 
 def _ensure_index_config(
     index_config: MemgraphIndexConfig,

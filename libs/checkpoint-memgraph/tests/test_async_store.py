@@ -39,7 +39,9 @@ def event_loop():
 
 
 @pytest.fixture(scope="function")
-async def async_driver(event_loop: asyncio.AbstractEventLoop) -> AsyncGenerator[Any, Any]:
+async def async_driver(
+    event_loop: asyncio.AbstractEventLoop,
+) -> AsyncGenerator[Any, Any]:
     """Create a shared async driver for the test session."""
     parsed = urlparse(DEFAULT_MEMGRAPH_URI)
     uri = f"{parsed.scheme}://{parsed.hostname}:{parsed.port or 7687}"
@@ -100,7 +102,6 @@ async def test_no_running_loop(store: AsyncMemgraphStore) -> None:
         result = await asyncio.wrap_future(
             executor.submit(store.list_namespaces, prefix=("foo",))
         )
-
 
 
 async def test_large_batches(request: Any, store: AsyncMemgraphStore) -> None:
@@ -291,6 +292,7 @@ async def test_batch_put_ops(store: AsyncMemgraphStore) -> None:
     items = await store.asearch(["test"], limit=10)
     assert len(items) == 2  # key3 had None value so wasn't stored
 
+
 async def test_batch_search_ops(store: AsyncMemgraphStore) -> None:
     # Setup test data
     await store.aput(("test", "foo"), "key1", {"data": "value1"})
@@ -324,13 +326,14 @@ async def test_batch_list_namespaces_ops(store: AsyncMemgraphStore) -> None:
     assert ("test", "namespace1") in results[0]
     assert ("test", "namespace2") in results[0]
 
+
 @asynccontextmanager
 async def _create_vector_store(
-        async_driver: AsyncDriver,
-        vector_type: str,
-        distance_type: str,
-        fake_embeddings: CharacterEmbeddings,
-        text_fields: list[str] | None = None,
+    async_driver: AsyncDriver,
+    vector_type: str,
+    distance_type: str,
+    fake_embeddings: CharacterEmbeddings,
+    text_fields: list[str] | None = None,
 ) -> AsyncIterator[AsyncMemgraphStore]:
     # Map distance_type from tests to Memgraph metric
     metric_map = {
@@ -369,23 +372,24 @@ async def _create_vector_store(
         (vector_type, distance_type)
         for vector_type in VECTOR_TYPES
         for distance_type in (
-                ["hamming"] if vector_type == "bit" else ["l2", "inner_product", "cosine"]
+            ["hamming"] if vector_type == "bit" else ["l2", "inner_product", "cosine"]
         )
     ],
 )
 async def vector_store(
-        request: Any,
-        async_driver: AsyncDriver,
-        fake_embeddings: CharacterEmbeddings,
+    request: Any,
+    async_driver: AsyncDriver,
+    fake_embeddings: CharacterEmbeddings,
 ) -> AsyncIterator[AsyncMemgraphStore]:
     vector_type, distance_type = request.param
     async with _create_vector_store(
-            async_driver, vector_type, distance_type, fake_embeddings
+        async_driver, vector_type, distance_type, fake_embeddings
     ) as store:
         yield store
 
+
 async def test_vector_store_initialization(
-        vector_store: AsyncMemgraphStore, fake_embeddings: CharacterEmbeddings
+    vector_store: AsyncMemgraphStore, fake_embeddings: CharacterEmbeddings
 ) -> None:
     """Test store initialization with embedding config."""
     assert vector_store.index_config is not None
@@ -395,7 +399,7 @@ async def test_vector_store_initialization(
 
 
 async def test_vector_insert_with_auto_embedding(
-        vector_store: AsyncMemgraphStore,
+    vector_store: AsyncMemgraphStore,
 ) -> None:
     """Test inserting items that get auto-embedded."""
     docs = [
@@ -413,6 +417,7 @@ async def test_vector_insert_with_auto_embedding(
     doc_order = [r.key for r in results]
     assert "doc2" in doc_order
     assert "doc3" in doc_order
+
 
 async def test_vector_update_with_embedding(vector_store: AsyncMemgraphStore) -> None:
     await vector_store.aput(("test",), "doc1", {"text": "zany zebra Xerxes"})
@@ -568,6 +573,7 @@ async def test_embed_with_path(
         assert results[0].score < ascore
         assert results[1].score < ascore
 
+
 @pytest.mark.parametrize(
     "vector_type,distance_type",
     [
@@ -603,6 +609,7 @@ async def test_search_sorting(
         assert len(set(r.key for r in results)) == 10
         assert results[0].key == "M"
         assert results[0].score > results[1].score
+
 
 async def test_store_ttl(store):
     # Assumes a TTL of 1 minute = 60 seconds

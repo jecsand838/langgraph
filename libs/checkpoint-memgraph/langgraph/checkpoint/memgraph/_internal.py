@@ -8,7 +8,6 @@ from typing import Union
 
 from neo4j import Driver, Session
 
-
 Conn = Union[Driver, Session]
 
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from contextlib import contextmanager
 from typing import Any, Generator
-from urllib.parse import urlparse, unquote
+from urllib.parse import unquote, urlparse
 
 import pytest
 from langchain_core.embeddings import Embeddings
@@ -17,7 +17,7 @@ from langgraph.store.base import (
     PutOp,
     SearchOp,
 )
-from langgraph.store.memgraph import MemgraphStore, MemgraphIndexConfig
+from langgraph.store.memgraph import MemgraphIndexConfig, MemgraphStore
 from tests.conftest import (
     DEFAULT_MEMGRAPH_URI,
     CharacterEmbeddings,
@@ -60,6 +60,7 @@ def store(driver: Driver) -> Generator[MemgraphStore, Any, None]:
     store.start_ttl_sweeper()
     yield store
     store.stop_ttl_sweeper()
+
 
 def test_from_conn_string():
     namespace = ("test_conn_string",)
@@ -388,7 +389,9 @@ def test_vector_insert_with_auto_embedding(vector_store: MemgraphStore) -> None:
 
 def test_vector_update_with_embedding(vector_store: MemgraphStore) -> None:
     vector_store.put(("test",), "doc1", {"text": "zany zebra Xerxes"}, index=["text"])
-    vector_store.put(("test",), "doc2", {"text": "something about dogs"}, index=["text"])
+    vector_store.put(
+        ("test",), "doc2", {"text": "something about dogs"}, index=["text"]
+    )
     results_initial = vector_store.search(("test",), query="Zany Xerxes")
     assert len(results_initial) > 0
     assert results_initial[0].key == "doc1"
@@ -559,6 +562,7 @@ def test_embed_with_path_operation_config(
         assert any(r.key == "doc5" for r in results)
         results = store.search(("test",), query="hhh")
 
+
 def _cosine_similarity(X: list[float], Y: list[list[float]]) -> list[float]:
     """
     Compute cosine similarity between a vector X and a matrix Y.
@@ -600,6 +604,7 @@ def _neg_l2_distance(X: list[float], Y: list[list[float]]) -> list[float]:
         similarity = sum((a - b) ** 2 for a, b in zip(X, y)) ** 0.5
         similarities.append(-similarity)
     return similarities
+
 
 @pytest.mark.parametrize("metric", ["cos", "ip", "l2sq"])
 @pytest.mark.parametrize("query", ["aaa", "bbb", "ccc", "abcd", "poisson"])
