@@ -3,8 +3,8 @@ services:
     image: memgraph/memgraph-mage:${MEMGRAPH_VERSION:-3.3}
     container_name: memgraph-mage
     ports:
-      - "7687:7687"
-      - "7444:7444"
+      - "7687:7687"      # Bolt
+      - "7444:7444"      # Logs / HTTP API
     command: ["--log-level=TRACE"]
     environment:
       - MEMGRAPH_USER=memgraph

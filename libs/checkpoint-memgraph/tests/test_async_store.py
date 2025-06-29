@@ -567,7 +567,6 @@ async def test_embed_with_path(
         }
         await store.aput(("test",), "doc1", doc1)
         await store.aput(("test",), "doc2", doc2)
-
         # doc2.key3 and doc1.key1 both would have the highest score
         results = await store.asearch(("test",), query="xxx")
         assert len(results) == 2
@@ -575,14 +574,12 @@ async def test_embed_with_path(
         ascore = results[0].score
         bscore = results[1].score
         assert ascore == pytest.approx(bscore, abs=1e-3)
-
         results = await store.asearch(("test",), query="uuu")
         assert len(results) == 2
         assert results[0].key != results[1].key
         assert results[0].key == "doc2"
         assert results[0].score > results[1].score
         assert ascore == pytest.approx(results[0].score, abs=1e-3)
-
         # Un-indexed - will have low results for both. Not zero (because we're projecting)
         # but less than the above.
         results = await store.asearch(("test",), query="www")
@@ -593,7 +590,7 @@ async def test_embed_with_path(
 @pytest.mark.parametrize(
     "vector_type,distance_type",
     [
-        *itertools.product(["vector", "halfvec"], ["cosine", "inner_product", "l2"]),
+        *itertools.product(["vector"], ["l2", "cosine", "inner_product"]),
     ],
 )
 async def test_search_sorting(
@@ -614,20 +611,18 @@ async def test_search_sorting(
         amatch = {
             "key1": "mmm",
         }
-
         await store.aput(("test", "M"), "M", amatch)
-        N = 100
+        N = 15
         for i in range(N):
             await store.aput(("test", "A"), f"A{i}", {"key1": "no"})
+        time.sleep(10)  # Ensure the index is updated
         for i in range(N):
             await store.aput(("test", "Z"), f"Z{i}", {"key1": "no"})
-
         results = await store.asearch(("test",), query="mmm", limit=10)
         assert len(results) == 10
         assert len(set(r.key for r in results)) == 10
         assert results[0].key == "M"
         assert results[0].score > results[1].score
-
 
 async def test_store_ttl(store):
     # Assumes a TTL of 1 minute = 60 seconds

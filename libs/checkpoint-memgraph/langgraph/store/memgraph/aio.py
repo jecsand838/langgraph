@@ -89,7 +89,6 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
         self.conn = conn
         self.lock = asyncio.Lock()
         self.loop = asyncio.get_running_loop()
-
         self.index_config = index
         if self.index_config:
             self.embeddings, self.index_config = _ensure_index_config(self.index_config)
@@ -140,6 +139,12 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
     ) -> None:
         if hasattr(self, "_ttl_sweeper_task") and self._ttl_sweeper_task is not None:
             await self.stop_ttl_sweeper()
+        if hasattr(self, "_task") and self._task and not self._task.done():
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
 
     @asynccontextmanager
     async def _session(self) -> AsyncIterator[AsyncSession]:
@@ -204,7 +209,6 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
                 "max_depth": op.max_depth,
             }
             match_clauses = ["(n.expires_at IS NULL OR n.expires_at >= localdatetime())"]
-
             if op.match_conditions:
                 for i, condition in enumerate(op.match_conditions):
                     path_param = f"path_{i}"
@@ -217,14 +221,11 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
                         logger.warning(
                             f"Unknown match_type in list_namespaces: {condition.match_type}"
                         )
-
             where_clause = f"WHERE {' AND '.join(match_clauses)}"
-
             limit_clause = ""
             if op.limit is not None:
                 limit_clause = "LIMIT $limit"
                 params["limit"] = op.limit
-
             query = f"""
                 MATCH (n:StoreItem)
                 {where_clause}
@@ -242,13 +243,11 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
                 {limit_clause}
             """
             queries.append((query, params))
-
         return queries
 
     async def abatch(self, ops: Iterable[Op]) -> list[Result]:
         grouped_ops, num_ops = _group_ops(ops)
         results: list[Result] = [None] * num_ops
-
         async with self._session() as session:
             async with self.lock, self._transaction(session) as tx:
                 if GetOp in grouped_ops:
@@ -305,60 +304,54 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
             tx: AsyncTransaction,
     ) -> None:
         queries, embedding_request = self._prepare_batch_PUT_queries(put_ops)
-
         for query, params in queries:
             await tx.run(query, params)
-
         if embedding_request:
             if self.embeddings is None:
                 raise ValueError(
                     "Embedding configuration is required for vector operations."
                 )
-
             query, txt_params = embedding_request
             unique_texts = sorted({param[-1] for param in txt_params})
             vectors = await self.embeddings.aembed_documents(unique_texts)
             text_to_vector = dict(zip(unique_texts, vectors))
-
             embedding_batch = [
                 {"prefix": ns, "key": k, "text": text, "embedding": text_to_vector[text]}
                 for (ns, k, text) in txt_params
             ]
-
             await tx.run(query, {"batch": embedding_batch})
 
     async def _batch_search_ops(
-        self,
-        search_ops: Sequence[tuple[int, SearchOp]],
-        results: list[Result],
-        tx: AsyncTransaction,
+            self,
+            search_ops: Sequence[tuple[int, SearchOp]],
+            results: list[Result],
+            tx: AsyncTransaction,
     ) -> None:
         queries, embedding_requests = self._prepare_batch_search_queries(search_ops)
-
+        op_idxs_requiring_embedding = {
+            op_idx for op_idx, text in embedding_requests if text
+        }
         op_idx_to_params = {
             op_idx: queries[i][1]
             for i, (op_idx, _) in enumerate(search_ops)
             if i < len(queries)
         }
-
         if embedding_requests and self.embeddings:
             unique_texts = sorted({text for _, text in embedding_requests if text})
             if unique_texts:
                 embeddings = await self.embeddings.aembed_documents(unique_texts)
                 text_to_embedding = dict(zip(unique_texts, embeddings))
-
                 for op_idx, text in embedding_requests:
                     if text and op_idx in op_idx_to_params:
-                        op_idx_to_params[op_idx]["embedding"] = text_to_embedding[text]
+                        op_idx_to_params[op_idx]["embedding"] = text_to_embedding.get(text)
 
         for i, (op_idx, op) in enumerate(search_ops):
             if i >= len(queries):
                 continue
             query, params = queries[i]
-            if op.query and not params.get("embedding"):
+            if op_idx in op_idxs_requiring_embedding and not params.get("embedding"):
                 results[op_idx] = []
                 continue
-
             result = await tx.run(query, params)
             search_items: list[SearchItem] = []
             async for record in result:
@@ -414,7 +407,6 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
         async with self._session() as session:
             async with self._transaction(session) as tx:
                 version = await _get_version(tx, "store_migrations")
-
             for v, cypher in enumerate(
                 self.MIGRATIONS[version + 1 :], start=version + 1
             ):
@@ -441,7 +433,6 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
                 ):
                     if migration.condition and not migration.condition(self):
                         continue
-
                     cypher = migration.cypher
                     params = {}
                     if migration.params:
@@ -499,13 +490,10 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
         """
         if not self.ttl_config:
             return asyncio.create_task(asyncio.sleep(0))
-
         if self._ttl_sweeper_task and not self._ttl_sweeper_task.done():
             logger.info("TTL sweeper task is already running")
             return self._ttl_sweeper_task
-
         self._ttl_stop_event.clear()
-
         interval = float(
             sweep_interval_minutes or self.ttl_config.get("sweep_interval_minutes") or 5
         )
@@ -522,10 +510,8 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
                     pass
                 except asyncio.CancelledError:
                     break
-
                 if self._ttl_stop_event.is_set():
                     break
-
                 try:
                     expired_items = await self.sweep_ttl()
                     if expired_items > 0:
@@ -534,7 +520,6 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
                     break
                 except Exception as exc:
                     logger.exception("Store TTL sweep iteration failed", exc_info=exc)
-
         task = asyncio.create_task(_sweep_loop())
         task.set_name("ttl-sweeper")
         self._ttl_sweeper_task = task
@@ -553,21 +538,17 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
         """
         if self._ttl_sweeper_task is None or self._ttl_sweeper_task.done():
             return True
-
         logger.info("Stopping TTL sweeper task")
         self._ttl_stop_event.set()
-
         try:
             await asyncio.wait_for(self._ttl_sweeper_task, timeout=timeout)
         except (asyncio.TimeoutError, asyncio.CancelledError):
             pass
-
         self._ttl_sweeper_task.cancel()
         try:
             await self._ttl_sweeper_task
         except asyncio.CancelledError:
             pass
-
         success = self._ttl_sweeper_task.done()
         if success:
             self._ttl_sweeper_task = None

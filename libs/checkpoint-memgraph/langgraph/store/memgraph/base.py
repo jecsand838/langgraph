@@ -74,11 +74,6 @@ if TYPE_CHECKING:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
-# --------------------------------------------------------------------------- #
-#  Migrations                                                                 #
-# --------------------------------------------------------------------------- #
-
-
 class Migration(NamedTuple):
     """A database migration with optional conditions and parameters."""
 
@@ -88,7 +83,6 @@ class Migration(NamedTuple):
 
 
 MIGRATIONS: Sequence[str] = [
-    # Basic schema for key/value storage
     "CREATE CONSTRAINT ON (n:StoreItem) ASSERT n.prefix, n.key IS UNIQUE;",
     "CREATE INDEX ON :StoreItem(prefix);",
     "CREATE INDEX ON :StoreItem(expires_at);",
@@ -96,14 +90,12 @@ MIGRATIONS: Sequence[str] = [
 
 VECTOR_MIGRATIONS: Sequence[Migration] = [
     Migration(
-        # Vector index – all fields are injected via .format(**params)
         """
 CREATE VECTOR INDEX vector_index ON :Embedding(embedding)
 WITH CONFIG {{
     "dimension": {dimension},
     "capacity": {capacity},
-    "metric": "{metric}",
-    "resize_coefficient": {resize_coeff}
+    "metric": "{metric}"
 }};
 """,
         params={
@@ -112,17 +104,9 @@ WITH CONFIG {{
             "metric": lambda store: cast(MemgraphIndexConfig, store.index_config).get(
                 "metric", "l2sq"
             ),
-            "resize_coeff": lambda store: cast(
-                MemgraphIndexConfig, store.index_config
-            ).get("resize_coefficient", 2),
         },
     ),
 ]
-
-# --------------------------------------------------------------------------- #
-#  Index‑config object                                                        #
-# --------------------------------------------------------------------------- #
-
 
 class MemgraphIndexConfig(IndexConfig, total=False):
     """Configuration for Memgraph vector indexing.
@@ -152,28 +136,18 @@ class MemgraphIndexConfig(IndexConfig, total=False):
     capacity: int
     metric: str  # keep open – Memgraph may add more metrics over time
     resize_coefficient: int
-
-    # retained for scoring – optional
     distance_type: Literal["l2", "cosine", "inner_product"]
 
 
 def _normalise_index_config(cfg: MemgraphIndexConfig) -> MemgraphIndexConfig:
     """Validate & enrich the user‑supplied index config."""
     cfg = cfg.copy()  # we never mutate the caller's object
-
-    # ---------------- Mandatory ---------------- #
     if "dimension" not in cfg or not isinstance(cfg["dimension"], int) or cfg["dimension"] <= 0:
         raise ValueError("MemgraphIndexConfig: 'dimension' (positive int) is required")
     if "capacity" not in cfg or not isinstance(cfg["capacity"], int) or cfg["capacity"] <= 0:
         raise ValueError("MemgraphIndexConfig: 'capacity' (positive int) is required")
-
-    # ---------------- Defaults ----------------- #
     cfg.setdefault("metric", "l2sq")
     cfg.setdefault("resize_coefficient", 2)
-
-    print("---CHECK CGF VALUES \n", cfg)
-
-    # ---------------- Derive distance_type ----- #
     if "distance_type" not in cfg:
         metric = cfg["metric"].lower()
         if metric in ("cos", "cosine"):
@@ -182,13 +156,7 @@ def _normalise_index_config(cfg: MemgraphIndexConfig) -> MemgraphIndexConfig:
             cfg["distance_type"] = "inner_product"
         else:  # treat everything else as some form of L2
             cfg["distance_type"] = "l2"
-
     return cfg
-
-
-# --------------------------------------------------------------------------- #
-#  Base store (shared helpers for sync & async)                               #
-# --------------------------------------------------------------------------- #
 
 C = TypeVar("C", bound=Union[Driver])
 
@@ -202,10 +170,6 @@ class BaseMemgraphStore(Generic[C]):
     conn: C
     _deserializer: Callable[[str], dict[str, Any]] | None
     index_config: MemgraphIndexConfig | None  # set during __init__
-
-    # --------------------------------------------------------------------- #
-    #  Batch‑GET helpers                                                    #
-    # --------------------------------------------------------------------- #
 
     def _get_batch_GET_ops_queries(
         self,
@@ -241,44 +205,30 @@ RETURN n.key         AS key,
             results.append((query, params, namespace, items))
         return results
 
-    # --------------------------------------------------------------------- #
-    #  Embedding extraction helpers                                         #
-    # --------------------------------------------------------------------- #
-
     def _extract_texts_for_embedding(
             self, inserts: list[PutOp]
     ) -> dict[tuple[str, str], list[str]]:
         """Collect texts that must be embedded according to index rules."""
         if not self.index_config:
             return {}
-
         texts_by_node: dict[tuple[str, str], list[str]] = defaultdict(list)
         default_paths = cast(dict, self.index_config)["__tokenized_fields"]
-
         for op in inserts:
             if op.index is False:
                 continue
-
             ns = _namespace_to_text(op.namespace)
             k = op.key
             value = op.value
-
             paths_to_index = (
                 default_paths
                 if op.index is None
                 else [(ix, tokenize_path(ix)) for ix in op.index]
             )
-
             for _, tokenized_path in paths_to_index:
                 texts = get_text_at_path(value, tokenized_path)
                 if texts:
                     texts_by_node[(ns, k)].extend(texts)
-
         return texts_by_node
-
-    # --------------------------------------------------------------------- #
-    #  Batch‑PUT helpers                                                    #
-    # --------------------------------------------------------------------- #
 
     def _prepare_batch_PUT_queries(
             self,
@@ -287,14 +237,12 @@ RETURN n.key         AS key,
             list[tuple[str, dict[str, Any]]],
             tuple[str, Sequence[tuple[str, str, str]]] | None,
         ]:
-        # Deduplicate ops → last one wins
         dedupped_ops: dict[tuple[tuple[str, ...], str], PutOp] = {
             (op.namespace, op.key): op for _, op in put_ops
         }
         inserts = [op for op in dedupped_ops.values() if op.value is not None]
         deletes = [op for op in dedupped_ops.values() if op.value is None]
         queries: list[tuple[str, dict[str, Any]]] = []
-        # Deletes first --------------------------------------------------- #
         if deletes:
             delete_batch = [
                 {"prefix": _namespace_to_text(op.namespace), "key": op.key}
@@ -310,7 +258,6 @@ DETACH DELETE n
                     {"batch": delete_batch},
                 )
             )
-        # Inserts / updates ------------------------------------------------ #
         embedding_request: tuple[str, Sequence[tuple[str, str, str]]] | None = None
         if inserts:
             insert_batch = []
@@ -321,8 +268,6 @@ DETACH DELETE n
                     "value": orjson.dumps(op.value).decode("utf-8"),
                     "ttl_minutes": op.ttl,
                 }
-                # Copy primitive top‑level fields to node properties to enable
-                # attribute‑based filtering.
                 if isinstance(op.value, dict):
                     for k, v in op.value.items():
                         if isinstance(v, (str, int, float, bool)):
@@ -343,7 +288,6 @@ SET n            = op,
         END
 """
             queries.append((put_query, {"batch": insert_batch}))
-            # --- Clear Stale Embeddings --- #
             queries.append(
                 (
                 """
@@ -354,7 +298,6 @@ SET n            = op,
                 {"batch": [{"prefix": _namespace_to_text(op.namespace), "key": op.key} for op in inserts]},
                 )
             )
-            # --- Embeddings ------------------------------------------------ #
             texts_by_node = self._extract_texts_for_embedding(inserts)
             if texts_by_node:
                 embedding_request_params = [
@@ -372,18 +315,12 @@ MERGE (n)-[:HAS_EMBEDDING]->(e)
                 )
         return queries, embedding_request
 
-    # --------------------------------------------------------------------- #
-    #  Search helpers                                                       #
-    # --------------------------------------------------------------------- #
-
     def _build_search_where_clause(self, op: SearchOp, params: dict[str, Any]) -> str:
         where = ["(n.expires_at IS NULL OR n.expires_at >= localdatetime())"]
-
         # Namespace filtering
         if op.namespace_prefix:
             where.append("n.prefix STARTS WITH $prefix")
             params["prefix"] = _namespace_to_text(op.namespace_prefix)
-
         # Field‑level filters
         if op.filter:
             i = 0
@@ -410,7 +347,6 @@ MERGE (n)-[:HAS_EMBEDDING]->(e)
                     where.append(f"n.{key} = ${pname}")
                     params[pname] = value
                     i += 1
-
         return f"WHERE {' AND '.join(where)}" if where else ""
 
     def _prepare_batch_search_queries(
@@ -419,23 +355,16 @@ MERGE (n)-[:HAS_EMBEDDING]->(e)
     ) -> tuple[list[tuple[str, dict[str, Any]]], list[tuple[int, str]]]:
         queries: list[tuple[str, dict[str, Any]]] = []
         embedding_requests: list[tuple[int, str]] = []
-
         for idx, op in search_ops:
             params: dict[str, Any] = {"offset": op.offset}
             where_stmt = self._build_search_where_clause(op, params)
-
             # Pagination
             limit_clause = ""
             if op.limit is not None:
                 limit_clause = "LIMIT $limit"
                 params["limit"] = op.limit
-
-            # ---------------------------------------------------------------- #
-            # Semantic search                                                  #
-            # ---------------------------------------------------------------- #
             if op.query and self.index_config:
                 embedding_requests.append((idx, op.query))
-
                 dist_type = cast(MemgraphIndexConfig, self.index_config).get(
                     "distance_type", "cosine"
                 ).lower()
@@ -443,14 +372,13 @@ MERGE (n)-[:HAS_EMBEDDING]->(e)
                     # For normalized vectors, as used in this test suite, Memgraph's
                     # COSINE and INNER_PRODUCT distances are both calculated as (1 - similarity).
                     # To get the similarity score, we must use (1 - distance).
-                    score_expr = "1.0 - distance"
+                    score_expr = "1.0 - best_distance"
                 else:  # Assumes 'l2' for 'l2sq' metric
                     # Memgraph 'l2sq' distance = (L2 distance)^2. Test expects negative L2 distance.
-                    score_expr = "-sqrt(distance)"
-
-                final_projection = "WITH n, score"
+                    score_expr = "-sqrt(best_distance)"
+                set_clause = ""
                 if op.refresh_ttl:
-                    final_projection += """
+                    set_clause = """
                     SET n.expires_at =
                         CASE
                             WHEN n.ttl_minutes IS NOT NULL
@@ -458,8 +386,7 @@ MERGE (n)-[:HAS_EMBEDDING]->(e)
                             ELSE n.expires_at
                         END
                     """
-
-                final_projection += """
+                return_clause = """
                 RETURN n.prefix      AS prefix,
                        n.key         AS key,
                        n.value       AS value,
@@ -467,35 +394,27 @@ MERGE (n)-[:HAS_EMBEDDING]->(e)
                        n.updated_at  AS updated_at,
                        score
                 """
-
                 query_parts = [
                     "CALL vector_search.search('vector_index', $k, $embedding)",
                     "YIELD node AS embedding_node, distance",
                     "MATCH (n:StoreItem)-[:HAS_EMBEDDING]->(embedding_node)",
-                    f"WITH n, {score_expr} AS score",
                     where_stmt,
-                    # Dedupe by parent node, taking the max score
-                    "WITH n, max(score) as score",
-                    "ORDER BY score DESC",
-                    "SKIP $offset",
-                    limit_clause,
-                    final_projection,
+                    "WITH n, min(distance) as best_distance",
+                    f"WITH n, {score_expr} AS score",
+                    f"WITH n, score ORDER BY score DESC SKIP $offset {limit_clause}",
+                    set_clause,
+                    return_clause,
                 ]
-
                 queries.append(
                     (
                         "\n".join([p for p in query_parts if p]),
                         {
                             **params,
-                            "k": op.limit + op.offset if op.limit is not None else 10,
+                            "k": max(100, (op.limit + op.offset) * 5),
                         },
                     )
                 )
                 continue  # done for this op
-
-            # ---------------------------------------------------------------- #
-            # Plain metadata search                                            #
-            # ---------------------------------------------------------------- #
             refresh_stmt = (
                 """
                 WITH n,
@@ -510,7 +429,6 @@ MERGE (n)-[:HAS_EMBEDDING]->(e)
                 if op.refresh_ttl
                 else "WITH n"
             )
-
             regular_query = f"""
     MATCH (n:StoreItem)
     {where_stmt}
@@ -526,12 +444,7 @@ MERGE (n)-[:HAS_EMBEDDING]->(e)
     {limit_clause}
     """
             queries.append((regular_query, params))
-
         return queries, embedding_requests
-
-    # --------------------------------------------------------------------- #
-    #  List‑namespaces helpers                                              #
-    # --------------------------------------------------------------------- #
 
     def _get_batch_list_namespaces_queries(
         self,
@@ -544,7 +457,6 @@ MERGE (n)-[:HAS_EMBEDDING]->(e)
                 "max_depth": op.max_depth,
             }
             match = ["(n.expires_at IS NULL OR n.expires_at >= localdatetime())"]
-
             if op.match_conditions:
                 for i, cond in enumerate(op.match_conditions):
                     p = f"path_{i}"
@@ -555,13 +467,11 @@ MERGE (n)-[:HAS_EMBEDDING]->(e)
                         match.append(f"n.prefix ENDS WITH ${p}")
                     else:
                         logger.warning("Unknown match_type %s", cond.match_type)
-
             where_clause = f"WHERE {' AND '.join(match)}"
             limit_clause = ""
             if op.limit is not None:
                 params["limit"] = op.limit
                 limit_clause = "LIMIT $limit"
-
             query = f"""
 MATCH (n:StoreItem)
 {where_clause}
@@ -581,20 +491,10 @@ SKIP $offset
             queries.append((query, params))
         return queries
 
-    # --------------------------------------------------------------------- #
-    #  JSON filter (not yet implemented)                                    #
-    # --------------------------------------------------------------------- #
-
     def _get_filter_condition(self, *_: Any, **__: Any) -> tuple[str, list]:
         raise NotImplementedError(
             "Filtering on JSON content is not supported in the Memgraph store."
         )
-
-
-# --------------------------------------------------------------------------- #
-#  Concrete store (sync)                                                     #
-# --------------------------------------------------------------------------- #
-
 
 class MemgraphStore(BaseStore, BaseMemgraphStore[Driver]):
     """Synchronous Memgraph store."""
@@ -608,12 +508,7 @@ class MemgraphStore(BaseStore, BaseMemgraphStore[Driver]):
         "_ttl_sweeper_thread",
         "_ttl_stop_event",
     )
-
     supports_ttl: bool = True
-
-    # ------------------------------------------------------------------ #
-    #  Construction                                                      #
-    # ------------------------------------------------------------------ #
 
     def __init__(
         self,
@@ -628,26 +523,17 @@ class MemgraphStore(BaseStore, BaseMemgraphStore[Driver]):
         self.database = database
         self._deserializer = deserializer or (lambda v: orjson.loads(v))
         self.conn = conn
-
-        # ---------------- Index handling ---------------- #
         self.index_config: MemgraphIndexConfig | None = None
         self.embeddings: Embeddings | None
-
         if index:
             # Validate & enrich config
             index = _normalise_index_config(index)
             self.embeddings, self.index_config = _ensure_index_config(index)
         else:
             self.embeddings = None
-
-        # ---------------- TTL handling ------------------ #
         self.ttl_config = ttl
         self._ttl_sweeper_thread: threading.Thread | None = None
         self._ttl_stop_event = threading.Event()
-
-    # ------------------------------------------------------------------ #
-    #  Convenience constructor                                           #
-    # ------------------------------------------------------------------ #
 
     @classmethod
     @contextmanager
@@ -665,10 +551,6 @@ class MemgraphStore(BaseStore, BaseMemgraphStore[Driver]):
         auth = (unquote(parsed.username or ""), unquote(parsed.password or ""))
         with GraphDatabase.driver(uri, auth=auth) as driver:
             yield cls(driver, database=database, index=index, ttl=ttl)
-
-    # ------------------------------------------------------------------ #
-    #  TTL sweeping (same semantics as PostgresStore)                    #
-    # ------------------------------------------------------------------ #
 
     def sweep_ttl(self) -> int:
         """Delete expired nodes and return count."""
@@ -692,7 +574,6 @@ RETURN count(n) as deleted_count
             future: concurrent.futures.Future[None] = concurrent.futures.Future()
             future.set_result(None)
             return future
-
         if self._ttl_sweeper_thread and self._ttl_sweeper_thread.is_alive():
             logger.info("TTL sweeper already running")
             fut = concurrent.futures.Future()
@@ -700,7 +581,6 @@ RETURN count(n) as deleted_count
                 lambda f: self._ttl_stop_event.set() if f.cancelled() else None
             )
             return fut
-
         self._ttl_stop_event.clear()
         interval = float(
             sweep_interval_minutes
@@ -708,7 +588,6 @@ RETURN count(n) as deleted_count
             or 5
         )
         logger.info("Starting TTL sweeper (interval=%smin)", interval)
-
         future = concurrent.futures.Future()
 
         def _sweep_loop() -> None:
@@ -753,10 +632,6 @@ RETURN count(n) as deleted_count
         if hasattr(self, "_ttl_stop_event") and hasattr(self, "_ttl_sweeper_thread"):
             self.stop_ttl_sweeper(timeout=0.1)
 
-    # ------------------------------------------------------------------ #
-    #  Internal session helpers                                          #
-    # ------------------------------------------------------------------ #
-
     @contextmanager
     def _session(self) -> Iterator[Session]:
         with self.conn.session(database=self.database) as session:
@@ -767,14 +642,9 @@ RETURN count(n) as deleted_count
         with session.begin_transaction() as tx:
             yield tx
 
-    # ------------------------------------------------------------------ #
-    #  Batch API (identical semantics to PostgresStore)                  #
-    # ------------------------------------------------------------------ #
-
     def batch(self, ops: Iterable[Op]) -> list[Result]:
         grouped, total = _group_ops(ops)
         results: list[Result] = [None] * total
-
         with self._session() as session, self._transaction(session) as tx:
             if PutOp in grouped:
                 self._batch_put_ops(cast(Sequence[tuple[int, PutOp]], grouped[PutOp]), tx)
@@ -798,10 +668,6 @@ RETURN count(n) as deleted_count
         """Async equivalent of ``batch``."""
         return await asyncio.get_running_loop().run_in_executor(None, self.batch, ops)
 
-    # ------------------------------------------------------------------ #
-    #  Private batch helpers (implementation identical to previous code) #
-    # ------------------------------------------------------------------ #
-
     def _batch_get_ops(
         self,
         get_ops: Sequence[tuple[int, GetOp]],
@@ -822,7 +688,6 @@ RETURN count(n) as deleted_count
         queries, embedding_req = self._prepare_batch_PUT_queries(put_ops)
         for q, p in queries:
             tx.run(q, p)
-
         if embedding_req:
             if self.embeddings is None:
                 raise ValueError("Embeddings config required for vector operations.")
@@ -841,7 +706,6 @@ RETURN count(n) as deleted_count
     ) -> None:
         queries, embedding_reqs = self._prepare_batch_search_queries(search_ops)
         op_idx_to_params = {op_idx: queries[i][1] for i, (op_idx, _) in enumerate(search_ops)}
-
         if embedding_reqs and self.embeddings:
             texts = sorted({t for _, t in embedding_reqs if t})
             embeddings = self.embeddings.embed_documents(texts)
@@ -849,7 +713,6 @@ RETURN count(n) as deleted_count
             for op_idx, text in embedding_reqs:
                 if text and op_idx in op_idx_to_params:
                     op_idx_to_params[op_idx]["embedding"] = t2e[text]
-
         for i, (op_idx, op) in enumerate(search_ops):
             query, params = queries[i]
             if op.query and not params.get("embedding"):
@@ -877,10 +740,6 @@ RETURN count(n) as deleted_count
                 _decode_ns_text(r["truncated_prefix"]) for r in rows if r["truncated_prefix"]
             ]
 
-    # ------------------------------------------------------------------ #
-    #  Database setup / migrations                                       #
-    # ------------------------------------------------------------------ #
-
     def setup(self) -> None:
         """Apply schema and vector‑index migrations (idempotent)."""
 
@@ -903,12 +762,9 @@ SET m.version = $v
 """,
                 {"table": table, "v": v},
             )
-
         with self._session() as session:
-            # ---------------- Core migrations ---------------- #
             with session.begin_transaction() as tx:
                 ver = _get_version(tx, "store_migrations")
-
             for v, cypher in enumerate(self.MIGRATIONS[ver + 1 :], start=ver + 1):
                 try:
                     session.run(cypher)
@@ -921,12 +777,9 @@ SET m.version = $v
                     else:
                         logger.error("Failed migration%s\nCypher:%s\nErr:%s", v, cypher, e)
                         raise
-
-            # ---------------- Vector‑index migrations ---------- #
             if self.index_config:
                 with session.begin_transaction() as tx:
                     ver = _get_version(tx, "vector_migrations")
-
                 for v, mig in enumerate(self.VECTOR_MIGRATIONS[ver + 1 :], start=ver + 1):
                     if mig.condition and not mig.condition(self):
                         continue
@@ -946,11 +799,6 @@ SET m.version = $v
                         else:
                             logger.error("Vector migration %s failed\nCypher:%s\nErr:%s", v, cypher, e)
                             raise
-
-
-# --------------------------------------------------------------------------- #
-#  Record & util helpers                                                     #
-# --------------------------------------------------------------------------- #
 
 class Record(TypedDict):
     key: str
@@ -985,7 +833,6 @@ def _record_to_item(
         updated_at=record["updated_at"].to_native(),
     )
 
-
 def _record_to_search_item(
     namespace: tuple[str, ...],
     record: Record,
@@ -1005,7 +852,6 @@ def _record_to_search_item(
         score=float(score) if score is not None else None,
     )
 
-
 def _group_ops(ops: Iterable[Op]) -> tuple[dict[type, list[tuple[int, Op]]], int]:
     groups: dict[type, list[tuple[int, Op]]] = defaultdict(list)
     total = 0
@@ -1014,11 +860,6 @@ def _group_ops(ops: Iterable[Op]) -> tuple[dict[type, list[tuple[int, Op]]], int
         total += 1
     return groups, total
 
-
-# --------------------------------------------------------------------------- #
-#  Index‑config tokenizer & embedding helper (unchanged)                     #
-# --------------------------------------------------------------------------- #
-
 def _ensure_index_config(
     index_config: MemgraphIndexConfig,
 ) -> tuple[Embeddings | None, MemgraphIndexConfig]:
@@ -1026,13 +867,11 @@ def _ensure_index_config(
     index_config = index_config.copy()
     tokenised: list[tuple[str, Literal["$"] | list[str]]] = []
     est_vectors = 0
-
     fields = index_config.get("fields") or ["$"]
     if isinstance(fields, str):
         fields = [fields]
     if not isinstance(fields, list):
         raise ValueError("'fields' in index config must be list or str")
-
     for p in fields:
         if p == "$":
             tokenised.append((p, "$"))
@@ -1041,7 +880,6 @@ def _ensure_index_config(
             toks = tokenize_path(p)
             tokenised.append((p, toks))
             est_vectors += len(toks)
-
     index_config["__tokenized_fields"] = tokenised
     index_config["__estimated_num_vectors"] = est_vectors
     embeddings = ensure_embeddings(index_config.get("embed"))
