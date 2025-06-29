@@ -92,7 +92,6 @@ class AsyncMemgraphSaver(BaseMemgraphSaver):
                 version = version_record["v"] if version_record else -1
             except Exception:
                 version = -1
-
             for v, migration in enumerate(self.MIGRATIONS):
                 if v > version:
                     if not migration.startswith("//"):
@@ -126,13 +125,11 @@ class AsyncMemgraphSaver(BaseMemgraphSaver):
         query += " ORDER BY c.checkpoint_id DESC"
         if limit:
             query += f" LIMIT {limit}"
-
         async with self._session() as tx:
             result = await tx.run(query, params)  # type: ignore
             records = [dict(record) async for record in result]
             if not records:
                 return
-
             to_migrate = [
                 r
                 for r in records
@@ -151,11 +148,9 @@ class AsyncMemgraphSaver(BaseMemgraphSaver):
                     },
                 )
                 sends_records = [dict(record) async for record in sends_result]
-
                 grouped_by_parent = defaultdict(list)
                 for record in to_migrate:
                     grouped_by_parent[record["parent_checkpoint_id"]].append(record)
-
                 for sends_record in sends_records:
                     parent_id = sends_record["checkpoint_id"]
                     for record in grouped_by_parent[parent_id]:
@@ -166,7 +161,6 @@ class AsyncMemgraphSaver(BaseMemgraphSaver):
                             record["checkpoint"],
                             record["channel_values"],
                         )
-
             for record in records:
                 yield await self._load_checkpoint_tuple(record)
 
@@ -186,13 +180,11 @@ class AsyncMemgraphSaver(BaseMemgraphSaver):
         )
         if "checkpoint_id" not in config["configurable"]:
             query += " ORDER BY c.checkpoint_id DESC LIMIT 1"
-
         async with self._session() as tx:
             result = await tx.run(query, params)  # type: ignore
             record = await result.single()
             if record is None:
                 return None
-
             record_dict = dict(record)
             if record_dict["checkpoint"].get("v", 0) < 4 and record_dict["parent_checkpoint_id"]:
                 thread_id = config["configurable"]["thread_id"]
@@ -213,7 +205,6 @@ class AsyncMemgraphSaver(BaseMemgraphSaver):
                         record_dict["checkpoint"],
                         record_dict["channel_values"],
                     )
-
             return await self._load_checkpoint_tuple(record_dict)
 
     async def aput(
@@ -238,7 +229,6 @@ class AsyncMemgraphSaver(BaseMemgraphSaver):
         thread_id = config["configurable"]["thread_id"]
         checkpoint_ns = config["configurable"].get("checkpoint_ns", "")
         parent_checkpoint_id = get_checkpoint_id(config)
-
         checkpoint_blobs = await asyncio.to_thread(
             self._dump_blobs,
             thread_id,
@@ -297,19 +287,15 @@ class AsyncMemgraphSaver(BaseMemgraphSaver):
             task_path,
             writes,
         )
-
         if not checkpoint_writes:
             return
-
         upsert_mode = all(w[0] in WRITES_IDX_MAP for w in writes)
         query_template = (
             self.UPSERT_CHECKPOINT_WRITES_CYPHER
             if upsert_mode
             else self.INSERT_CHECKPOINT_WRITES_CYPHER
         )
-
         async with self._session() as tx:
-            # FIX: Pass the entire list as the 'writes' parameter
             await tx.run(query_template, writes=checkpoint_writes)
 
     async def adelete_thread(self, thread_id: str) -> None:

@@ -70,7 +70,7 @@ async def store(async_driver: AsyncDriver) -> AsyncIterator[AsyncMemgraphStore]:
             time.sleep(0.5)
         except Exception:
             pass
-
+    time.sleep(10)
     await store.setup()
     await store.start_ttl_sweeper()
     yield store
@@ -340,7 +340,6 @@ async def _create_vector_store(
         "hamming": "hamming",
     }
     metric = metric_map.get(distance_type, "l2sq")
-
     # Create a valid index_config
     index_config = {
         "dimension": fake_embeddings.dims,
@@ -358,6 +357,7 @@ async def _create_vector_store(
             time.sleep(0.5)
         except Exception:
             pass
+    time.sleep(10)
     store = AsyncMemgraphStore(async_driver, index=index_config)
     await store.setup()
     yield store
@@ -408,10 +408,8 @@ async def test_vector_insert_with_auto_embedding(
     ]
     for key, value in docs:
         await vector_store.aput(("test",), key, value)
-
     results = await vector_store.asearch(("test",), query="long text")
     assert len(results) > 0
-
     doc_order = [r.key for r in results]
     assert "doc2" in doc_order
     assert "doc3" in doc_order
@@ -420,23 +418,18 @@ async def test_vector_update_with_embedding(vector_store: AsyncMemgraphStore) ->
     await vector_store.aput(("test",), "doc1", {"text": "zany zebra Xerxes"})
     await vector_store.aput(("test",), "doc2", {"text": "something about dogs"})
     await vector_store.aput(("test",), "doc3", {"text": "text about birds"})
-
     results_initial = await vector_store.asearch(("test",), query="Zany Xerxes")
     assert len(results_initial) > 0
     assert results_initial[0].key == "doc1"
     initial_score = results_initial[0].score
-
     await vector_store.aput(("test",), "doc1", {"text": "new text about dogs"})
-
     results_after = await vector_store.asearch(("test",), query="Zany Xerxes")
     after_score = next((r.score for r in results_after if r.key == "doc1"), 0.0)
     assert after_score < initial_score
-
     results_new = await vector_store.asearch(("test",), query="new text about dogs")
     for r in results_new:
         if r.key == "doc1":
             assert r.score > after_score
-
     # Don't index this one
     await vector_store.aput(
         ("test",), "doc4", {"text": "new text about dogs"}, index=False
@@ -455,28 +448,23 @@ async def test_vector_search_with_filters(vector_store: AsyncMemgraphStore) -> N
         ("doc3", {"text": "green apple", "color": "green", "score": 4.0}),
         ("doc4", {"text": "blue car", "color": "blue", "score": 3.5}),
     ]
-
     for key, value in docs:
         await vector_store.aput(("test",), key, value)
-
     results = await vector_store.asearch(
         ("test",), query="apple", filter={"color": "red"}
     )
     assert len(results) == 2
     assert results[0].key == "doc1"
-
     results = await vector_store.asearch(
         ("test",), query="car", filter={"color": "red"}
     )
     assert len(results) == 2
     assert results[0].key == "doc2"
-
     results = await vector_store.asearch(
         ("test",), query="bbbbluuu", filter={"score": {"$gt": 3.2}}
     )
     assert len(results) == 3
     assert results[0].key == "doc4"
-
     results = await vector_store.asearch(
         ("test",), query="apple", filter={"score": {"$gte": 4.0}, "color": "green"}
     )
@@ -495,11 +483,9 @@ async def test_vector_search_pagination(vector_store: AsyncMemgraphStore) -> Non
     results_page2 = await vector_store.asearch(
         ("test",), query="test", limit=2, offset=2
     )
-
     assert len(results_page1) == 2
     assert len(results_page2) == 2
     assert results_page1[0].key != results_page2[0].key
-
     all_results = await vector_store.asearch(("test",), query="test", limit=10)
     assert len(all_results) == 5
 
@@ -507,23 +493,18 @@ async def test_vector_search_pagination(vector_store: AsyncMemgraphStore) -> Non
 async def test_vector_search_edge_cases(vector_store: AsyncMemgraphStore) -> None:
     """Test edge cases in vector search."""
     await vector_store.aput(("test",), "doc1", {"text": "test document"})
-
     perfect_match = await vector_store.asearch(("test",), query="text test document")
     perfect_score = perfect_match[0].score
-
     results = await vector_store.asearch(("test",), query="")
     assert len(results) == 1
     assert results[0].score is None
-
     results = await vector_store.asearch(("test",), query=None)
     assert len(results) == 1
     assert results[0].score is None
-
     long_query = "foo " * 100
     results = await vector_store.asearch(("test",), query=long_query)
     assert len(results) == 1
     assert results[0].score < perfect_score
-
     special_query = "test!@#$%^&*()"
     results = await vector_store.asearch(("test",), query=special_query)
     assert len(results) == 1
@@ -615,7 +596,6 @@ async def test_search_sorting(
         N = 15
         for i in range(N):
             await store.aput(("test", "A"), f"A{i}", {"key1": "no"})
-        time.sleep(10)  # Ensure the index is updated
         for i in range(N):
             await store.aput(("test", "Z"), f"Z{i}", {"key1": "no"})
         results = await store.asearch(("test",), query="mmm", limit=10)

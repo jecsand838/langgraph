@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import threading
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
@@ -72,24 +71,18 @@ class MemgraphSaver(BaseMemgraphSaver):
         don't already exist and runs any pending database migrations. It should be
         called once before the checkpointer is used.
         """
-        # DDL commands like CREATE CONSTRAINT must be run in auto-commit transactions.
         with self.driver.session() as session:
             try:
-                # Get current migration version
                 result = session.run(
                     "MATCH (m:Migration) RETURN m.v AS v ORDER BY m.v DESC LIMIT 1"
                 )
                 version = result.single(strict=True)["v"]
             except Exception:
                 version = -1
-
-            # Run new migrations
             for v, migration in enumerate(self.MIGRATIONS):
                 if v > version:
                     if not migration.startswith("//"):  # Skip no-op comments
-                        # Run schema changes in their own auto-commit transaction
                         session.run(migration)
-                    # Update migration version in its own auto-commit transaction
                     session.run("MERGE (m:Migration {v: $v})", v=v)
 
     def list(
@@ -113,21 +106,16 @@ class MemgraphSaver(BaseMemgraphSaver):
             An iterator of checkpoint tuples.
         """
         where_clause, params = self._search_where_and_params(config, filter, before)
-        # Inject the WHERE clause into the SELECT_CYPHER template
         query = self.SELECT_CYPHER.replace(
             "MATCH (c:Checkpoint)", f"MATCH (c:Checkpoint) {where_clause}"
         )
-        # Append ordering and limit clauses
         query += " ORDER BY c.checkpoint_id DESC"
         if limit:
             query += f" LIMIT {limit}"
-
         with self._session() as tx:
             records = [dict(r) for r in tx.run(query, params)] # type: ignore
             if not records:
                 return
-
-            # Perform pending sends migration if necessary for older checkpoints
             to_migrate = [
                 r
                 for r in records
@@ -136,7 +124,6 @@ class MemgraphSaver(BaseMemgraphSaver):
             if to_migrate:
                 thread_id = records[0]["thread_id"]
                 parent_ids = list({r["parent_checkpoint_id"] for r in to_migrate})
-
                 sends_records = list(tx.run(
                     self.SELECT_PENDING_SENDS_CYPHER,
                     {
@@ -145,11 +132,9 @@ class MemgraphSaver(BaseMemgraphSaver):
                         "tasks_channel": TASKS,
                     },
                 ))
-
                 grouped_by_parent = defaultdict(list)
                 for record in to_migrate:
                     grouped_by_parent[record["parent_checkpoint_id"]].append(record)
-
                 for sends_record in sends_records:
                     parent_id = sends_record["checkpoint_id"]
                     for record in grouped_by_parent[parent_id]:
@@ -160,7 +145,6 @@ class MemgraphSaver(BaseMemgraphSaver):
                             record["checkpoint"],
                             record["channel_values"],
                         )
-
             for record in records:
                 yield self._load_checkpoint_tuple(record)
 
@@ -181,15 +165,12 @@ class MemgraphSaver(BaseMemgraphSaver):
         query = self.SELECT_CYPHER.replace(
             "MATCH (c:Checkpoint)", f"MATCH (c:Checkpoint) {where_clause}"
         )
-
         if "checkpoint_id" not in config["configurable"]:
             query += " ORDER BY c.checkpoint_id DESC LIMIT 1"
-
         with self._session() as tx:
             result = tx.run(query, params).single() # type: ignore
             if result is None:
                 return None
-
             record = dict(result)
             # Perform pending sends migration if necessary
             if record["checkpoint"].get("v", 0) < 4 and record["parent_checkpoint_id"]:
@@ -209,7 +190,6 @@ class MemgraphSaver(BaseMemgraphSaver):
                         record["checkpoint"],
                         record["channel_values"],
                     )
-
             return self._load_checkpoint_tuple(record)
 
     def put(
@@ -234,19 +214,16 @@ class MemgraphSaver(BaseMemgraphSaver):
         thread_id = config["configurable"]["thread_id"]
         checkpoint_ns = config["configurable"].get("checkpoint_ns", "")
         parent_checkpoint_id = get_checkpoint_id(config)
-
         checkpoint_blobs = self._dump_blobs(
             thread_id,
             checkpoint_ns,
             checkpoint["channel_values"],
             new_versions,
         )
-
         with self._session() as tx:
             # Batch upsert blobs using UNWIND
             if checkpoint_blobs:
                 tx.run(self.UPSERT_CHECKPOINT_BLOBS_CYPHER, blobs=checkpoint_blobs)
-
             # Upsert checkpoint
             tx.run(
                 self.UPSERT_CHECKPOINTS_CYPHER,
@@ -257,7 +234,6 @@ class MemgraphSaver(BaseMemgraphSaver):
                 checkpoint=checkpoint,
                 metadata=get_checkpoint_metadata(config, metadata),
             )
-
         return {
             "configurable": {
                 "thread_id": thread_id,
@@ -290,19 +266,14 @@ class MemgraphSaver(BaseMemgraphSaver):
             task_path,
             writes,
         )
-
         if not checkpoint_writes:
             return
-
-        # FIX: Access tuple by index w[0] instead of string key w["channel"]
         upsert_mode = all(w[0] in WRITES_IDX_MAP for w in writes)
         query_template = (
             self.UPSERT_CHECKPOINT_WRITES_CYPHER
             if upsert_mode
             else self.INSERT_CHECKPOINT_WRITES_CYPHER
         )
-
-        # Batch insert/upsert writes using UNWIND
         with self._session() as tx:
             tx.run(query_template, writes=checkpoint_writes)
 

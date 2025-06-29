@@ -166,7 +166,6 @@ class BaseMemgraphStore(Generic[C]):
 
     MIGRATIONS = MIGRATIONS
     VECTOR_MIGRATIONS = VECTOR_MIGRATIONS
-
     conn: C
     _deserializer: Callable[[str], dict[str, Any]] | None
     index_config: MemgraphIndexConfig | None  # set during __init__

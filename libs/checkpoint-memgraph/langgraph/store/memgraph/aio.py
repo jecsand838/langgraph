@@ -5,7 +5,7 @@ import logging
 from collections.abc import AsyncIterator, Iterable, Sequence
 from contextlib import asynccontextmanager
 from types import TracebackType
-from typing import Any, Callable, Literal, cast
+from typing import Any, Callable, cast
 from urllib.parse import unquote, urlparse
 
 import orjson
@@ -14,9 +14,7 @@ from neo4j.exceptions import Neo4jError
 
 from langgraph.store.base import (
     GetOp,
-    Item,
     ListNamespacesOp,
-    MatchCondition,
     Op,
     PutOp,
     Result,

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import json
 import random
 from collections.abc import Sequence
 from typing import Any, Optional, cast
@@ -16,13 +15,7 @@ from langgraph.checkpoint.base import (
 )
 from langgraph.checkpoint.serde.types import TASKS
 
-# ---------------------------------------------------------------------------
-
 MetadataInput = Optional[dict[str, Any]]
-
-# ---------------------------------------------------------------------------
-# Schema‑management & query templates
-# ---------------------------------------------------------------------------
 
 MEMGRAPH_MIGRATIONS = [
     # v0
@@ -94,10 +87,6 @@ WITH w.checkpoint_id AS checkpoint_id, w
 ORDER BY w.task_path, w.task_id, w.idx
 RETURN checkpoint_id, collect([w.type, w.blob]) AS sends
 """
-
-# ---------------------------------------------------------------------------
-#  Templates referenced by saver methods (WITH internal UNWIND!)
-# ---------------------------------------------------------------------------
 
 UPSERT_CHECKPOINT_BLOBS_CYPHER = """
 UNWIND $blobs AS props
@@ -174,11 +163,6 @@ CREATE (w:Write {
 MERGE (c)-[:HAS_WRITE]->(w)
 """
 
-# ---------------------------------------------------------------------------
-# Base class
-# ---------------------------------------------------------------------------
-
-
 class BaseMemgraphSaver(BaseCheckpointSaver[str]):
     """Common implementation used by both the sync and async savers."""
 
@@ -191,12 +175,6 @@ class BaseMemgraphSaver(BaseCheckpointSaver[str]):
     INSERT_CHECKPOINT_WRITES_CYPHER = INSERT_CHECKPOINT_WRITES_CYPHER
 
     supports_pipeline: bool
-
-    # ---------------------------------------------------------------------
-    #  Internal helpers
-    # ---------------------------------------------------------------------
-
-    # -- blob (de)serialisation helpers -----------------------------------
 
     @staticmethod
     def _encode_blob(value: Any) -> Any:
@@ -216,8 +194,6 @@ class BaseMemgraphSaver(BaseCheckpointSaver[str]):
                 return value
         return value
 
-    # -- pending‑send migration ------------------------------------------
-
     def _migrate_pending_sends(
         self,
         pending_sends: list[tuple[str, bytes | str]],
@@ -227,18 +203,15 @@ class BaseMemgraphSaver(BaseCheckpointSaver[str]):
         """Move legacy pending sends into checkpoint.channel_values."""
         if not pending_sends:
             return
-
         # Decode blobs before deserializing
         deserialized_sends = [
             self.serde.loads_typed((type_, self._decode_blob(blob)))
             for type_, blob in pending_sends
         ]
-
         # Re-serialize the entire list of values for the new channel
         enc, blob = self.serde.dumps_typed(deserialized_sends)
         blob = self._encode_blob(blob)
         channel_values.append((TASKS, enc, blob))
-
         # Assign/bump version for the new channel
         if "channel_versions" not in checkpoint:
             checkpoint["channel_versions"] = {}
@@ -247,8 +220,6 @@ class BaseMemgraphSaver(BaseCheckpointSaver[str]):
             if checkpoint["channel_versions"]
             else self.get_next_version(None, None)
         )
-
-    # -- blob helpers -----------------------------------------------------
 
     def _load_blobs(
         self,
@@ -273,7 +244,6 @@ class BaseMemgraphSaver(BaseCheckpointSaver[str]):
         """Prepare blob rows for UNWIND insertion."""
         if not versions:
             return []
-
         blobs: list[dict[str, Any]] = []
         for channel, version in versions.items():
             type_, blob = (
@@ -291,8 +261,6 @@ class BaseMemgraphSaver(BaseCheckpointSaver[str]):
                 }
             )
         return blobs
-
-    # -- write helpers ----------------------------------------------------
 
     def _load_writes(
         self,
@@ -337,8 +305,6 @@ class BaseMemgraphSaver(BaseCheckpointSaver[str]):
             )
         return dumped
 
-    # -- misc -------------------------------------------------------------
-
     def get_next_version(self, current: str | None, channel: None) -> str:
         """Return a monotonically‑increasing version string."""
         if current is None:
@@ -360,29 +326,23 @@ class BaseMemgraphSaver(BaseCheckpointSaver[str]):
         """Compose Cypher WHERE clause & params from user filters."""
         wheres: list[str] = []
         params: dict[str, Any] = {}
-
         if config:
             if thread_id := config["configurable"].get("thread_id"):
                 wheres.append("c.thread_id = $thread_id")
                 params["thread_id"] = thread_id
-
             if checkpoint_ns := config["configurable"].get("checkpoint_ns"):
                 wheres.append("c.checkpoint_ns = $checkpoint_ns")
                 params["checkpoint_ns"] = checkpoint_ns
-
             if checkpoint_id := get_checkpoint_id(config):
                 wheres.append("c.checkpoint_id = $checkpoint_id")
                 params["checkpoint_id"] = checkpoint_id
-
         if filter:
             for key, value in filter.items():
                 param_key = f"metadata_{key}"
                 wheres.append(f"c.metadata.{key} = ${param_key}")
                 params[param_key] = value
-
         if before is not None:
             if before_id := get_checkpoint_id(before):
                 wheres.append("c.checkpoint_id < $before_checkpoint_id")
                 params["before_checkpoint_id"] = before_id
-
         return ("WHERE " + " AND ".join(wheres)) if wheres else "", params

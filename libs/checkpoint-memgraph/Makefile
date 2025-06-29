@@ -5,11 +5,6 @@
 # TESTING AND COVERAGE
 ######################
 
-# -------------------------------------------------------------------------
-# Spin up a temporary Memgraph instance for integration/acceptance tests.
-# - `MEMGRAPH_VERSION` may be overridden (defaults to 2.13).
-# - The docker‑compose file is located at tests/compose‑memgraph.yml.
-# -------------------------------------------------------------------------
 start-memgraph:
 	MEMGRAPH_VERSION=${MEMGRAPH_VERSION:-3.3} docker compose -f tests/compose-memgraph.yml up -V --force-recreate --wait || ( \
 		echo "Failed to start Memgraph, printing logs..."; \
@@ -20,10 +15,6 @@ start-memgraph:
 stop-memgraph:
 	docker compose -f tests/compose-memgraph.yml down
 
-# -------------------------------------------------------------------------
-# Run the full test-suite against a matrix of Memgraph versions.
-# Adjust MEMGRAPH_VERSIONS if you need a different matrix.
-# -------------------------------------------------------------------------
 MEMGRAPH_VERSIONS ?= 3.3
 
 test_memgraph_version:
