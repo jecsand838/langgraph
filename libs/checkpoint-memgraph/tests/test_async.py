@@ -1,3 +1,4 @@
+from collections.abc import AsyncGenerator
 from typing import Any
 from urllib.parse import unquote, urlparse
 
@@ -23,20 +24,15 @@ def _exclude_keys(config: dict[str, Any]) -> dict[str, Any]:
 
 
 @pytest.fixture
-async def saver():
+async def saver() -> AsyncGenerator[AsyncMemgraphSaver, None]:
     """Fixture for AsyncMemgraphSaver testing."""
     # Parse the connection string to separate URI from credentials
     parsed = urlparse(DEFAULT_MEMGRAPH_URI)
     uri = f"{parsed.scheme}://{parsed.hostname}:{parsed.port or 7687}"
     auth = (unquote(parsed.username or ""), unquote(parsed.password or ""))
-
-    # Create the async driver
     driver = AsyncGraphDatabase.driver(uri, auth=auth)
-
-    # Initialize the checkpointer and run setup
     checkpointer = AsyncMemgraphSaver(driver)
     await checkpointer.setup()
-
     try:
         yield checkpointer
     finally:
@@ -47,8 +43,7 @@ async def saver():
 
 
 @pytest.fixture
-def test_data():
-    """Fixture providing common test data for checkpoint tests."""
+def test_data() -> dict[str, Any]:
     config_1: RunnableConfig = {
         "configurable": {
             "thread_id": "thread-1",
@@ -70,11 +65,9 @@ def test_data():
             "checkpoint_ns": "inner",
         }
     }
-
     chkpnt_1: Checkpoint = empty_checkpoint()
     chkpnt_2: Checkpoint = create_checkpoint(chkpnt_1, {}, 1)
     chkpnt_3: Checkpoint = empty_checkpoint()
-
     metadata_1: CheckpointMetadata = {
         "source": "input",
         "step": 2,
@@ -88,7 +81,6 @@ def test_data():
         "score": None,
     }
     metadata_3: CheckpointMetadata = {}
-
     return {
         "configs": [config_1, config_2, config_3],
         "checkpoints": [chkpnt_1, chkpnt_2, chkpnt_3],
@@ -97,8 +89,10 @@ def test_data():
 
 
 @pytest.mark.asyncio
-async def test_combined_metadata(saver: AsyncMemgraphSaver, test_data) -> None:
-    config = {
+async def test_combined_metadata(
+    saver: AsyncMemgraphSaver, test_data: dict[str, Any]
+) -> None:
+    config: Any = {
         "configurable": {
             "thread_id": "thread-2",
             "checkpoint_ns": "",
@@ -113,10 +107,9 @@ async def test_combined_metadata(saver: AsyncMemgraphSaver, test_data) -> None:
         "writes": {"foo": "bar"},
         "score": None,
     }
-
     saved_config = await saver.aput(config, chkpnt, metadata, {})
     checkpoint = await saver.aget_tuple(saved_config)
-
+    assert checkpoint is not None
     # The get_checkpoint_metadata helper correctly excludes dunder keys.
     # The assertion should only check for the combination of public metadata.
     assert checkpoint.metadata == {
@@ -126,37 +119,27 @@ async def test_combined_metadata(saver: AsyncMemgraphSaver, test_data) -> None:
 
 
 @pytest.mark.asyncio
-async def test_alist(saver: AsyncMemgraphSaver, test_data) -> None:
+async def test_alist(saver: AsyncMemgraphSaver, test_data: dict[str, Any]) -> None:
     configs = test_data["configs"]
     checkpoints = test_data["checkpoints"]
     metadata = test_data["metadata"]
-
     await saver.aput(configs[0], checkpoints[0], metadata[0], {})
     await saver.aput(configs[1], checkpoints[1], metadata[1], {})
     await saver.aput(configs[2], checkpoints[2], metadata[2], {})
-
-    # Define metadata filter queries
     query_1 = {"source": "input"}
     query_2 = {"step": 1, "writes": {"foo": "bar"}}
     query_3: dict[str, Any] = {}
     query_4 = {"source": "update", "step": 1}
-
-    # Test metadata filters
     search_results_1 = [c async for c in saver.alist(None, filter=query_1)]
     assert len(search_results_1) == 1
     assert search_results_1[0].metadata == metadata[0]
-
     search_results_2 = [c async for c in saver.alist(None, filter=query_2)]
     assert len(search_results_2) == 1
     assert search_results_2[0].metadata == metadata[1]
-
     search_results_3 = [c async for c in saver.alist(None, filter=query_3)]
     assert len(search_results_3) == 3
-
     search_results_4 = [c async for c in saver.alist(None, filter=query_4)]
     assert len(search_results_4) == 0
-
-    # Test search by config (thread_id)
     search_results_5 = [
         c async for c in saver.alist({"configurable": {"thread_id": "thread-2"}})
     ]
@@ -169,52 +152,34 @@ async def test_alist(saver: AsyncMemgraphSaver, test_data) -> None:
 
 @pytest.mark.asyncio
 async def test_pending_sends_migration(saver: AsyncMemgraphSaver) -> None:
-    config = {
+    config: Any = {
         "configurable": {
             "thread_id": "thread-1",
             "checkpoint_ns": "",
         }
     }
-
-    # Create the first checkpoint
     checkpoint_0 = empty_checkpoint()
     config = await saver.aput(config, checkpoint_0, {}, {})
-
-    # Put some pending sends linked to the first checkpoint
     await saver.aput_writes(
         config, [(TASKS, "send-1"), (TASKS, "send-2")], task_id="task-1"
     )
     await saver.aput_writes(config, [(TASKS, "send-3")], task_id="task-2")
-
-    # Check that fetching checkpoint_0 directly shows no channel values
     tuple_0 = await saver.aget_tuple(config)
     assert tuple_0 is not None
     assert tuple_0.checkpoint["channel_values"] == {}
     assert tuple_0.checkpoint["channel_versions"] == {}
-
-    # The `writes` attribute is not part of the CheckpointTuple in this version,
-    # so we can't assert on it directly. The main test is to ensure
-    # the writes are migrated to the next checkpoint's values.
-
-    # Create the second checkpoint
     checkpoint_1 = create_checkpoint(checkpoint_0, {}, 1)
     config = await saver.aput(config, checkpoint_1, {}, {})
-
-    # Check that pending sends are now attached to checkpoint_1's values
     tuple_1 = await saver.aget_tuple(config)
     assert tuple_1 is not None
     assert tuple_1.checkpoint["channel_values"] == {
         TASKS: ["send-1", "send-2", "send-3"]
     }
     assert TASKS in tuple_1.checkpoint["channel_versions"]
-
-    # Check that listing checkpoints also applies the migration correctly
     search_results = [
         c async for c in saver.alist({"configurable": {"thread_id": "thread-1"}})
     ]
     assert len(search_results) == 2
-
-    # The newer checkpoint (checkpoint_1) should have the migrated sends
     assert (
         search_results[0].config["configurable"]["checkpoint_id"] == checkpoint_1["id"]
     )
@@ -222,8 +187,6 @@ async def test_pending_sends_migration(saver: AsyncMemgraphSaver) -> None:
         TASKS: ["send-1", "send-2", "send-3"]
     }
     assert TASKS in search_results[0].checkpoint["channel_versions"]
-
-    # The older checkpoint (checkpoint_0) should not have them
     assert (
         search_results[1].config["configurable"]["checkpoint_id"] == checkpoint_0["id"]
     )

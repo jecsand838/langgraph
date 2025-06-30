@@ -25,7 +25,17 @@ from .base import BaseMemgraphSaver
 
 
 class MemgraphSaver(BaseMemgraphSaver):
-    """Checkpointer that stores checkpoints in a Memgraph database."""
+    """A checkpointer that stores checkpoints in a Memgraph database.
+
+    This class provides a checkpointer that uses a Memgraph graph database for
+    persistent storage of langgraph checkpoints. It allows for saving, listing, and
+    retrieving checkpoints, enabling the resumption of graph execution from a known
+    state.
+
+    It requires a `neo4j` driver instance to connect to the Memgraph database.
+    Before its first use, the `setup()` method should be called to ensure the
+    database schema (indexes, constraints) is correctly initialized.
+    """
 
     driver: Driver
     lock: threading.Lock
@@ -112,7 +122,7 @@ class MemgraphSaver(BaseMemgraphSaver):
         if limit:
             query += f" LIMIT {limit}"
         with self._session() as tx:
-            records = [dict(r) for r in tx.run(query, params)]  # type: ignore
+            records = [dict(r) for r in tx.run(query, params)]
             if not records:
                 return
             to_migrate = [
@@ -169,7 +179,7 @@ class MemgraphSaver(BaseMemgraphSaver):
         if "checkpoint_id" not in config["configurable"]:
             query += " ORDER BY c.checkpoint_id DESC LIMIT 1"
         with self._session() as tx:
-            result = tx.run(query, params).single()  # type: ignore
+            result = tx.run(query, params).single()
             if result is None:
                 return None
             record = dict(result)
@@ -286,7 +296,6 @@ class MemgraphSaver(BaseMemgraphSaver):
             thread_id: The ID of the thread to delete.
         """
         with self._session() as tx:
-            # Consolidate delete operations into a single query
             tx.run(
                 """
                 MATCH (c:Checkpoint {thread_id: $thread_id})
@@ -339,7 +348,7 @@ class MemgraphSaver(BaseMemgraphSaver):
                 if record["parent_checkpoint_id"]
                 else None
             ),
-            self._load_writes(record.get("pending_writes")),
+            self._load_writes(record.get("pending_writes") or []),
         )
 
 

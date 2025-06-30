@@ -165,7 +165,24 @@ MERGE (c)-[:HAS_WRITE]->(w)
 
 
 class BaseMemgraphSaver(BaseCheckpointSaver[str]):
-    """Common implementation used by both the sync and async savers."""
+    """A base class for saving LangGraph checkpoints to a Memgraph database.
+
+    This class provides the core logic for interacting with Memgraph, serving as a
+    foundation for both synchronous and asynchronous saver implementations. It defines
+    the necessary Cypher queries for creating, reading, and updating checkpoint data,
+    including the main checkpoint information, associated blobs (channel values),
+    and pending writes.
+
+    Attributes:
+        SELECT_CYPHER (str): Cypher query to select checkpoint data.
+        SELECT_PENDING_SENDS_CYPHER (str): Cypher query to select pending sends.
+        MIGRATIONS (list[str]): A list of Cypher queries for database schema migrations.
+        UPSERT_CHECKPOINT_BLOBS_CYPHER (str): Cypher query to upsert blob data.
+        UPSERT_CHECKPOINTS_CYPHER (str): Cypher query to upsert checkpoint data.
+        UPSERT_CHECKPOINT_WRITES_CYPHER (str): Cypher query to upsert write data.
+        INSERT_CHECKPOINT_WRITES_CYPHER (str): Cypher query to insert write data.
+        supports_pipeline (bool): Flag indicating if the saver supports pipelined operations.
+    """
 
     SELECT_CYPHER = SELECT_CYPHER
     SELECT_PENDING_SENDS_CYPHER = SELECT_PENDING_SENDS_CYPHER
@@ -313,7 +330,22 @@ class BaseMemgraphSaver(BaseCheckpointSaver[str]):
         return dumped
 
     def get_next_version(self, current: str | None, channel: None) -> str:
-        """Return a monotonically‑increasing version string."""
+        """Generate a new, monotonically increasing version string.
+
+        This method is used to create version strings that are always greater than
+        the previous ones. The version string consists of a zero-padded integer
+        and a random float, separated by a dot.
+
+        Args:
+            current: The current version string (e.g., "1.234"). If None, the
+                major version will be 1. Only the part before the first dot is
+                considered for incrementing.
+            channel: Unused in this implementation.
+
+        Returns:
+            A new version string, guaranteed to be lexicographically greater
+            than the `current` one.
+        """
         if current is None:
             current_major = 0
         elif isinstance(current, int):

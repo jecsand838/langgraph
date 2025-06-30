@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from collections import defaultdict
-from collections.abc import AsyncIterator, Iterator, Sequence
+from collections.abc import AsyncIterator, Coroutine, Iterator, Sequence
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, cast
 
 from langchain_core.runnables import RunnableConfig
 from neo4j import AsyncDriver, AsyncGraphDatabase, AsyncTransaction
@@ -23,11 +24,9 @@ from langgraph.checkpoint.serde.types import TASKS
 
 from .base import BaseMemgraphSaver
 
-try:
-    # Available in Python 3.10+
+if sys.version_info >= (3, 10):
     from builtins import anext
-except ImportError:
-    # Custom implementation for Python 3.9
+else:
     _sentinel = object()
 
     async def anext(iterator, default=_sentinel):
@@ -41,7 +40,24 @@ except ImportError:
 
 
 class AsyncMemgraphSaver(BaseMemgraphSaver):
-    """Asynchronous checkpointer that stores checkpoints in a Memgraph database."""
+    """Asynchronous checkpointer that stores checkpoints in a Memgraph database.
+
+    This class provides an asynchronous interface for persisting checkpoints to a Memgraph
+    database. It leverages the `neo4j.AsyncDriver` for non-blocking database
+    communication and is designed for use in asynchronous applications where
+    blocking I/O operations are undesirable.
+
+    The class manages an asyncio event loop and uses a lock to ensure that
+    concurrent operations on the database are handled safely.
+
+    Attributes:
+        driver (AsyncDriver): An instance of `neo4j.AsyncDriver` used to interact
+            with the Memgraph database.
+        lock (asyncio.Lock): An asyncio lock to prevent race conditions during
+            database writes.
+        loop (asyncio.AbstractEventLoop): The asyncio event loop used for scheduling
+            the asynchronous database operations.
+    """
 
     driver: AsyncDriver
     lock: asyncio.Lock
@@ -66,7 +82,6 @@ class AsyncMemgraphSaver(BaseMemgraphSaver):
         try:
             self.loop = asyncio.get_running_loop()
         except RuntimeError:
-            # This is to allow usage in a non-async context (e.g., in a background thread)
             self.loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.loop)
 
@@ -141,7 +156,7 @@ class AsyncMemgraphSaver(BaseMemgraphSaver):
         if limit:
             query += f" LIMIT {limit}"
         async with self._session() as tx:
-            result = await tx.run(query, params)  # type: ignore
+            result = await tx.run(query, params)
             records = [dict(record) async for record in result]
             if not records:
                 return
@@ -153,7 +168,6 @@ class AsyncMemgraphSaver(BaseMemgraphSaver):
             if to_migrate:
                 thread_id = records[0]["thread_id"]
                 parent_ids = list({r["parent_checkpoint_id"] for r in to_migrate})
-
                 sends_result = await tx.run(
                     self.SELECT_PENDING_SENDS_CYPHER,
                     {
@@ -196,7 +210,7 @@ class AsyncMemgraphSaver(BaseMemgraphSaver):
         if "checkpoint_id" not in config["configurable"]:
             query += " ORDER BY c.checkpoint_id DESC LIMIT 1"
         async with self._session() as tx:
-            result = await tx.run(query, params)  # type: ignore
+            result = await tx.run(query, params)
             record = await result.single()
             if record is None:
                 return None
@@ -254,14 +268,12 @@ class AsyncMemgraphSaver(BaseMemgraphSaver):
             checkpoint["channel_values"],
             new_versions,
         )
-
         async with self._session() as tx:
             if checkpoint_blobs:
                 await tx.run(
                     self.UPSERT_CHECKPOINT_BLOBS_CYPHER,
                     blobs=checkpoint_blobs,
                 )
-
             await tx.run(
                 self.UPSERT_CHECKPOINTS_CYPHER,
                 thread_id=thread_id,
@@ -271,7 +283,6 @@ class AsyncMemgraphSaver(BaseMemgraphSaver):
                 checkpoint=checkpoint,
                 metadata=get_checkpoint_metadata(config, metadata),
             )
-
         return {
             "configurable": {
                 "thread_id": thread_id,
@@ -357,8 +368,8 @@ class AsyncMemgraphSaver(BaseMemgraphSaver):
             A structured CheckpointTuple.
         """
         channel_values, pending_writes = await asyncio.gather(
-            asyncio.to_thread(self._load_blobs, record.get("channel_values")),
-            asyncio.to_thread(self._load_writes, record.get("pending_writes")),
+            asyncio.to_thread(self._load_blobs, record.get("channel_values") or []),
+            asyncio.to_thread(self._load_writes, record.get("pending_writes") or []),
         )
         return CheckpointTuple(
             {
@@ -387,8 +398,6 @@ class AsyncMemgraphSaver(BaseMemgraphSaver):
             pending_writes,
         )
 
-    # Sync methods for background thread execution
-
     def list(
         self,
         config: RunnableConfig | None,
@@ -397,6 +406,17 @@ class AsyncMemgraphSaver(BaseMemgraphSaver):
         before: RunnableConfig | None = None,
         limit: int | None = None,
     ) -> Iterator[CheckpointTuple]:
+        """List checkpoints for a thread.
+
+        Args:
+            config: The config of the thread to list checkpoints for.
+            filter: A filter to apply to the checkpoints.
+            before: A checkpoint to list checkpoints before.
+            limit: The maximum number of checkpoints to return.
+
+        Returns:
+            An iterator of checkpoint tuples.
+        """
         if asyncio.get_running_loop() is self.loop:
             raise asyncio.InvalidStateError(
                 "Sync `list` can't be called from the same event loop. Use `alist`."
@@ -405,12 +425,20 @@ class AsyncMemgraphSaver(BaseMemgraphSaver):
         while True:
             try:
                 yield asyncio.run_coroutine_threadsafe(
-                    anext(aiter_), self.loop
+                    cast(Coroutine, anext(aiter_)), self.loop
                 ).result()
             except StopAsyncIteration:
                 break
 
     def get_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
+        """Get a checkpoint tuple from the database.
+
+        Args:
+            config: The config of the checkpoint to get.
+
+        Returns:
+            The checkpoint tuple, or None if it doesn't exist.
+        """
         if asyncio.get_running_loop() is self.loop:
             raise asyncio.InvalidStateError(
                 "Sync `get_tuple` can't be called from the same event loop. Use `aget_tuple`."
@@ -426,6 +454,17 @@ class AsyncMemgraphSaver(BaseMemgraphSaver):
         metadata: CheckpointMetadata,
         new_versions: ChannelVersions,
     ) -> RunnableConfig:
+        """Put a checkpoint in the database.
+
+        Args:
+            config: The config of the checkpoint to put.
+            checkpoint: The checkpoint to put.
+            metadata: The metadata of the checkpoint.
+            new_versions: The new versions of the channels.
+
+        Returns:
+            The config of the checkpoint that was put.
+        """
         return asyncio.run_coroutine_threadsafe(
             self.aput(config, checkpoint, metadata, new_versions), self.loop
         ).result()
@@ -437,11 +476,24 @@ class AsyncMemgraphSaver(BaseMemgraphSaver):
         task_id: str,
         task_path: str = "",
     ) -> None:
+        """Put a list of writes in the database.
+
+        Args:
+            config: The config of the checkpoint to put.
+            writes: A list of writes to put.
+            task_id: The ID of the task that is performing the writes.
+            task_path: The path of the task that is performing the writes.
+        """
         return asyncio.run_coroutine_threadsafe(
             self.aput_writes(config, writes, task_id, task_path), self.loop
         ).result()
 
     def delete_thread(self, thread_id: str) -> None:
+        """Delete a thread from the database.
+
+        Args:
+            thread_id: The ID of the thread to delete.
+        """
         if asyncio.get_running_loop() is self.loop:
             raise asyncio.InvalidStateError(
                 "Sync `delete_thread` can't be called from the same event loop. Use `adelete_thread`."

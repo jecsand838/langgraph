@@ -3,11 +3,10 @@ from __future__ import annotations
 import time
 from collections.abc import Generator
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, Union, cast
 from urllib.parse import unquote, urlparse
 
 import pytest
-from langchain_core.embeddings import Embeddings
 from neo4j import Driver, GraphDatabase
 
 from langgraph.store.base import (
@@ -16,7 +15,9 @@ from langgraph.store.base import (
     ListNamespacesOp,
     MatchCondition,
     PutOp,
+    SearchItem,
     SearchOp,
+    TTLConfig,
 )
 from langgraph.store.memgraph import MemgraphIndexConfig, MemgraphStore
 from tests.conftest import (
@@ -41,7 +42,7 @@ def driver() -> Generator[Driver, Any, None]:
 
 @pytest.fixture(scope="function")
 def store(driver: Driver) -> Generator[MemgraphStore, Any, None]:
-    ttl_config = {
+    ttl_config: TTLConfig = {
         "default_ttl": TTL_MINUTES,
         "refresh_on_read": True,
         "sweep_interval_minutes": TTL_MINUTES / 2,
@@ -63,7 +64,7 @@ def store(driver: Driver) -> Generator[MemgraphStore, Any, None]:
     store.stop_ttl_sweeper()
 
 
-def test_from_conn_string():
+def test_from_conn_string() -> None:
     namespace = ("test_conn_string",)
     key = "key1"
     with MemgraphStore.from_conn_string(DEFAULT_MEMGRAPH_URI) as store:
@@ -81,7 +82,7 @@ def test_batch_order(store: MemgraphStore) -> None:
     # Setup test data
     store.put(("test", "foo"), "key1", {"data": "value1"})
     store.put(("test", "bar"), "key2", {"data": "value2"})
-    ops = [
+    ops: list[Union[GetOp, PutOp, SearchOp, ListNamespacesOp]] = [
         GetOp(namespace=("test", "foo"), key="key1"),
         PutOp(namespace=("test", "bar"), key="key2", value={"data": "value2"}),
         SearchOp(
@@ -103,7 +104,7 @@ def test_batch_order(store: MemgraphStore) -> None:
     assert len(results[3]) >= 2
     assert results[4] is None  # Non-existent key returns None
     # Test reordered operations
-    ops_reordered = [
+    ops_reordered: list[Union[SearchOp, GetOp, ListNamespacesOp, PutOp]] = [
         SearchOp(namespace_prefix=("test",), filter=None, limit=5, offset=0),
         GetOp(namespace=("test", "bar"), key="key2"),
         ListNamespacesOp(match_conditions=None, max_depth=None, limit=5, offset=0),
@@ -138,7 +139,9 @@ def test_batch_get_ops(store: MemgraphStore) -> None:
     assert results[0] is not None
     assert results[1] is not None
     assert results[2] is None
+    assert isinstance(results[0], Item)
     assert results[0].key == "key1"
+    assert isinstance(results[1], Item)
     assert results[1].key == "key2"
 
 
@@ -177,13 +180,16 @@ def test_batch_search_ops(store: MemgraphStore) -> None:
     results = store.batch(ops)
     assert len(results) == 3
     # First search should find items with tag "a"
+    assert isinstance(results[0], list)
     assert len(results[0]) == 2
-    assert all(item.value["tag"] == "a" for item in results[0])
+    assert all(item.value["tag"] == "a" for item in cast(list[SearchItem], results[0]))
     # Second search should return first 2 items (order by updated_at desc)
+    assert isinstance(results[1], list)
     assert len(results[1]) == 2
     # Third search should only find items in test.foo namespace
+    assert isinstance(results[2], list)
     assert len(results[2]) == 1
-    assert results[2][0].namespace == ("test", "foo")
+    assert cast(list[SearchItem], results[2])[0].namespace == ("test", "foo")
 
 
 def test_batch_list_namespaces_ops(store: MemgraphStore) -> None:
@@ -200,7 +206,7 @@ def test_batch_list_namespaces_ops(store: MemgraphStore) -> None:
         ListNamespacesOp(match_conditions=None, max_depth=None, limit=10, offset=0),
         ListNamespacesOp(match_conditions=None, max_depth=2, limit=10, offset=0),
         ListNamespacesOp(
-            match_conditions=[MatchCondition(match_type="suffix", path=("public",))],
+            match_conditions=(MatchCondition(match_type="suffix", path=("public",)),),
             max_depth=None,
             limit=10,
             offset=0,
@@ -208,9 +214,12 @@ def test_batch_list_namespaces_ops(store: MemgraphStore) -> None:
     ]
     results = store.batch(ops)
     assert len(results) == 3
+    assert isinstance(results[0], list)
     assert len(results[0]) >= len(test_data)
-    assert all(len(ns) <= 2 for ns in results[1])
-    assert all(ns[-1] == "public" for ns in results[2])
+    assert isinstance(results[1], list)
+    assert all(len(ns) <= 2 for ns in cast(list[tuple[str, ...]], results[1]))
+    assert isinstance(results[2], list)
+    assert all(ns[-1] == "public" for ns in cast(list[tuple[str, ...]], results[2]))
 
 
 def test_basic_store_ops(store: MemgraphStore) -> None:
@@ -227,6 +236,7 @@ def test_basic_store_ops(store: MemgraphStore) -> None:
     updated_value = {"title": "Updated Document", "content": "Hello, Updated!"}
     store.put(namespace, item_id, updated_value)
     updated_item = store.get(namespace, item_id)
+    assert updated_item is not None
     assert updated_item.value == updated_value
     assert updated_item.updated_at > item.updated_at
     # Test get from non-existent namespace
@@ -267,7 +277,7 @@ def test_list_namespaces(store: MemgraphStore) -> None:
         store.delete(namespace, "dummy")
 
 
-def test_search(store) -> None:
+def test_search(store: MemgraphStore) -> None:
     # Create test data
     test_data = [
         (
@@ -288,17 +298,17 @@ def test_search(store) -> None:
     ]
     for namespace, key, value in test_data:
         store.put(namespace, key, value)
-    all_items = store.search(["test"])
+    all_items = store.search(("test",))
     assert len(all_items) == 3
-    docs_items = store.search(["test", "docs"])
+    docs_items = store.search(("test", "docs"))
     assert len(docs_items) == 2
     assert all(item.namespace == ("test", "docs") for item in docs_items)
-    alice_items = store.search(["test"], filter={"author": "Alice"})
+    alice_items = store.search(("test",), filter={"author": "Alice"})
     assert len(alice_items) == 2
-    assert all(item.value["author"] == "Alice" for item in alice_items)
-    paginated_items = store.search(["test"], limit=2)
+    assert all(cast(dict, item.value).get("author") == "Alice" for item in alice_items)
+    paginated_items = store.search(("test",), limit=2)
     assert len(paginated_items) == 2
-    offset_items = store.search(["test"], offset=2)
+    offset_items = store.search(("test",), offset=2)
     assert len(offset_items) == 1
     for namespace, key, _ in test_data:
         store.delete(namespace, key)
@@ -316,7 +326,7 @@ _vector_params += [(_vector_params[-1][0], False)]
 def vector_store(
     driver: Driver,
     request: Any,
-    fake_embeddings: Embeddings,
+    fake_embeddings: CharacterEmbeddings,
 ) -> Generator[MemgraphStore, Any, None]:
     metric, enable_ttl = request.param
     index_config: MemgraphIndexConfig = {
@@ -326,14 +336,19 @@ def vector_store(
         "metric": metric,
         "fields": ["text"],
     }
-    ttl_config = {"default_ttl": 2, "refresh_on_read": True} if enable_ttl else None
+    ttl_config: TTLConfig | None = (
+        {"default_ttl": 2, "refresh_on_read": True} if enable_ttl else None
+    )
     # Clean the database before each test
     with driver.session() as session:
         session.run("MATCH (n) DETACH DELETE n").consume()
+        time.sleep(1)  # Allow time for the database to reset
         try:
             session.run("DROP VECTOR INDEX vector_index").consume()
+            time.sleep(1)  # Allow time for the database to reset
         except Exception:
             pass
+    time.sleep(5)
     store = MemgraphStore(driver, index=index_config, ttl=ttl_config)
     store.setup()
     yield store
@@ -343,7 +358,7 @@ def vector_store(
 def _create_vector_store_with_text_fields(
     driver: Driver,
     metric: str,
-    fake_embeddings: Embeddings,
+    fake_embeddings: CharacterEmbeddings,
     text_fields: list[str] | None = None,
 ) -> Generator[MemgraphStore, Any, None]:
     index_config: MemgraphIndexConfig = {
@@ -355,8 +370,10 @@ def _create_vector_store_with_text_fields(
     }
     with driver.session() as session:
         session.run("MATCH (n) DETACH DELETE n").consume()
+        time.sleep(1)  # Allow time for the database to reset
         try:
             session.run("DROP VECTOR INDEX vector_index").consume()
+            time.sleep(1)  # Allow time for the database to reset
         except Exception:
             pass
     time.sleep(5)  # Allow time for the database to reset
@@ -400,7 +417,7 @@ def test_vector_update_with_embedding(vector_store: MemgraphStore) -> None:
     assert initial_score is not None
     vector_store.put(("test",), "doc1", {"text": "new text about dogs"}, index=["text"])
     results_after = vector_store.search(("test",), query="Zany Xerxes")
-    after_score = next((r.score for r in results_after if r.key == "doc1"), 0.0)
+    after_score = next((r.score for r in results_after if r.key == "doc1"), None)
     assert after_score is not None
     assert after_score < initial_score
     results_new = vector_store.search(("test",), query="new text about dogs")
@@ -483,17 +500,21 @@ def test_embed_with_path_sync(
         store.put(("test",), "doc1", doc1)
         store.put(("test",), "doc2", doc2)
         # doc2.key3 and doc1.key1 both would have the highest score
-        results = store.search(("test",), query="xxx")
+        results: list[SearchItem] = store.search(("test",), query="xxx")
         assert len(results) == 2
         assert results[0].key != results[1].key
         ascore = results[0].score
         bscore = results[1].score
+        assert ascore is not None
+        assert bscore is not None
         assert ascore == pytest.approx(bscore, abs=1e-3)
         # ~Only match doc2
         results = store.search(("test",), query="uuu")
         assert len(results) == 2
         assert results[0].key != results[1].key
         assert results[0].key == "doc2"
+        assert results[0].score is not None
+        assert results[1].score is not None
         assert results[0].score > results[1].score
         assert ascore == pytest.approx(results[0].score, abs=1e-3)
         # ~Only match doc1
@@ -501,6 +522,8 @@ def test_embed_with_path_sync(
         assert len(results) == 2
         assert results[0].key != results[1].key
         assert results[0].key == "doc1"
+        assert results[0].score is not None
+        assert results[1].score is not None
         assert results[0].score > results[1].score
         assert ascore == pytest.approx(results[0].score, abs=1e-3)
         # Un-indexed - will have low results for both. Not zero (because we're projecting)
@@ -508,6 +531,8 @@ def test_embed_with_path_sync(
         results = store.search(("test",), query="www")
         assert len(results) == 2
         assert results[0].key != results[1].key
+        assert results[0].score is not None
+        assert results[1].score is not None
         assert results[0].score < ascore
         assert results[1].score < ascore
 
@@ -533,23 +558,29 @@ def test_embed_with_path_operation_config(
         }
         store.put(("test",), "doc3", doc3, index=["key0", "key1"])
         store.put(("test",), "doc4", doc4, index=["key1", "key3"])
-        results = store.search(("test",), query="aaa")
+        results: list[SearchItem] = store.search(("test",), query="aaa")
         assert len(results) == 2
         assert results[0].key == "doc3"
         assert len(set(r.key for r in results)) == 2
+        assert results[0].score is not None
+        assert results[1].score is not None
         assert results[0].score > results[1].score
         results = store.search(("test",), query="ggg")
         assert len(results) == 2
         assert results[0].key == "doc4"
+        assert results[0].score is not None
+        assert results[1].score is not None
         assert results[0].score > results[1].score
         results = store.search(("test",), query="bbb")
         assert len(results) == 2
         assert results[0].key != results[1].key
+        assert results[0].score is not None
+        assert results[1].score is not None
         assert results[0].score == pytest.approx(results[1].score, abs=1e-3)
         results = store.search(("test",), query="ccc")
         assert len(results) == 2
         assert all(
-            r.score < 0.9 for r in results
+            r.score is not None and r.score < 0.9 for r in results
         )  # Unindexed field should have low scores
         # Test index=False behavior
         doc5 = {
@@ -561,7 +592,7 @@ def test_embed_with_path_operation_config(
         assert len(results) == 3
         assert all(r.score is None for r in results), f"{results}"
         assert any(r.key == "doc5" for r in results)
-        results = store.search(("test",), query="hhh")
+        store.search(("test",), query="hhh")
 
 
 def _cosine_similarity(X: list[float], Y: list[list[float]]) -> list[float]:
@@ -641,7 +672,7 @@ def test_nonnull_migrations() -> None:
         assert migration.strip()
 
 
-def test_store_ttl(store: MemgraphStore):
+def test_store_ttl(store: MemgraphStore) -> None:
     ns = ("foo",)
     store.put(ns, key="item1", value={"foo": "bar"}, ttl=TTL_MINUTES)
     time.sleep(TTL_SECONDS + 0.1)

@@ -1,32 +1,3 @@
-"""Memgraph‑backed implementation of the LangGraph key/value & vector store.
-
-The code matches the public surface of ``PostgresStore`` so that callers can
-freely switch between the two back‑ends simply by changing the connection URI
-and the concrete ``Store`` class.
-
-Key additions in this version
------------------------------
-* **MemgraphIndexConfig**
-  - Now exposes every officially‑supported vector‑index parameter:
-      • ``dimension``(required) – vector dimensionality
-      • ``capacity``(required) – initial index capacity
-      • ``metric`` – similarity metric (default ``"l2sq"``)
-      • ``resize_coefficient`` – growth factor (default``2``)
-      • ``distance_type`` is retained for score‑calculation parity and is
-        automatically derived from ``metric`` when omitted.
-
-* **Vector‑index migration**
-  - Creates the index with the full config map
-    (``dimension``, ``capacity``, ``metric``, ``resize_coefficient``).
-
-* **Config validation / normalisation**
-  - Ensures mandatory fields exist and applies sensible defaults.
-  - Derives ``distance_type`` from ``metric`` when not supplied.
-
-Nothing else in the public interface changed – the store continues to satisfy
-all contracts defined by ``BaseStore`` and mirrors ``PostgresStore`` semantics.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -50,7 +21,7 @@ from typing import (
 from urllib.parse import unquote, urlparse
 
 import orjson
-from neo4j import Driver, GraphDatabase, Session, Transaction
+from neo4j import AsyncDriver, Driver, GraphDatabase, Session, Transaction
 from typing_extensions import TypedDict
 
 from langgraph.store.base import (
@@ -134,7 +105,6 @@ class MemgraphIndexConfig(IndexConfig, total=False):
         automatically** from *metric* so existing code paths keep working.
     """
 
-    # new, Memgraph‑native fields
     dimension: int
     capacity: int
     metric: str  # keep open – Memgraph may add more metrics over time
@@ -170,11 +140,31 @@ def _normalise_index_config(cfg: MemgraphIndexConfig) -> MemgraphIndexConfig:
     return cfg
 
 
-C = TypeVar("C", bound=Union[Driver])
+C = TypeVar("C", bound=Union[Driver, AsyncDriver])
 
 
 class BaseMemgraphStore(Generic[C]):
-    """Shared implementation for Memgraph synchronised & async stores."""
+    """A base class providing shared implementation for Memgraph stores.
+
+    This generic class encapsulates the common logic for both synchronous and
+    asynchronous Memgraph store implementations (`MemgraphStore` and
+    `AsyncMemgraphStore`). It is not intended to be used directly.
+
+    The class is generic over the connection type `C`, which can be either a
+    synchronous or asynchronous Memgraph driver. This allows the query-building
+    logic to be shared between both store variants.
+
+    Attributes:
+        MIGRATIONS (list[str]): A list of Cypher queries for applying standard
+            schema migrations.
+        VECTOR_MIGRATIONS (list[Migration]): A list of `Migration` objects for
+            applying vector index schema migrations.
+        conn (C): The Memgraph database connection object (driver).
+        _deserializer (Callable | None): A function to deserialize stored JSON
+            values.
+        index_config (MemgraphIndexConfig | None): The configuration for the
+            vector search index.
+    """
 
     MIGRATIONS = MIGRATIONS
     VECTOR_MIGRATIONS = VECTOR_MIGRATIONS
@@ -182,7 +172,7 @@ class BaseMemgraphStore(Generic[C]):
     _deserializer: Callable[[str], dict[str, Any]] | None
     index_config: MemgraphIndexConfig | None  # set during __init__
 
-    def _get_batch_GET_ops_queries(
+    def _get_batch_get_ops_queries(
         self,
         get_ops: Sequence[tuple[int, GetOp]],
     ) -> list[tuple[str, dict, tuple[str, ...], list]]:
@@ -191,7 +181,6 @@ class BaseMemgraphStore(Generic[C]):
             namespace_groups[op.namespace].append(
                 {"idx": idx, "key": op.key, "refresh_ttl": op.refresh_ttl}
             )
-
         results: list[tuple[str, dict, tuple[str, ...], list]] = []
         for namespace, items in namespace_groups.items():
             ns_text = _namespace_to_text(namespace)
@@ -241,7 +230,7 @@ RETURN n.key         AS key,
                     texts_by_node[(ns, k)].extend(texts)
         return texts_by_node
 
-    def _prepare_batch_PUT_queries(
+    def _prepare_batch_put_queries(
         self,
         put_ops: Sequence[tuple[int, PutOp]],
     ) -> tuple[
@@ -382,11 +371,7 @@ MERGE (n)-[:HAS_EMBEDDING]->(e)
                 params["limit"] = op.limit
             if op.query and self.index_config:
                 embedding_requests.append((idx, op.query))
-                dist_type = (
-                    cast(MemgraphIndexConfig, self.index_config)
-                    .get("distance_type", "cosine")
-                    .lower()
-                )
+                dist_type = self.index_config.get("distance_type", "cosine").lower()
                 if dist_type == "cosine" or dist_type == "inner_product":
                     # For normalized vectors, as used in this test suite, Memgraph's
                     # COSINE and INNER_PRODUCT distances are both calculated as (1 - similarity).
@@ -517,7 +502,41 @@ SKIP $offset
 
 
 class MemgraphStore(BaseStore, BaseMemgraphStore[Driver]):
-    """Synchronous Memgraph store."""
+    """A synchronous client for storing and retrieving data from Memgraph.
+
+    This class provides a comprehensive interface for interacting with a Memgraph
+    database, supporting key-value storage, document search, and vector similarity
+    search. It is designed to work with a synchronous Memgraph driver and
+    handles the complexities of session and transaction management.
+
+    Key Features:
+    - **Batch Operations**: Efficiently process multiple read, write, and search
+      operations in a single transaction using the `batch` and `abatch` methods.
+    - **Vector Search**: When configured with an `index`, the store can embed
+      text data, store the resulting vectors, and perform similarity searches.
+    - **Time-to-Live (TTL)**: Supports automatic expiration of stored items.
+      A background sweeper thread can be started to periodically remove
+      expired data.
+    - **Schema Management**: Includes a `setup` method to idempotently create
+      necessary database constraints and indexes.
+
+    Args:
+        conn: An active Memgraph database driver instance.
+        database: The name of the database to use (defaults to "memgraph").
+        deserializer: A function to deserialize stored values from JSON.
+            Defaults to `orjson.loads`.
+        index: An optional `MemgraphIndexConfig` to enable and configure
+            vector search capabilities.
+        ttl: An optional `TTLConfig` to configure automatic data expiration.
+
+    Attributes:
+        conn: The underlying Memgraph database driver.
+        database: The name of the database being used.
+        index_config: The validated and enriched vector index configuration.
+        embeddings: The embedding model instance used for vector operations.
+        ttl_config: The configuration for Time-To-Live (TTL) functionality.
+        supports_ttl: A boolean flag indicating that the store supports TTL.
+    """
 
     __slots__ = (
         "database",
@@ -565,7 +584,23 @@ class MemgraphStore(BaseStore, BaseMemgraphStore[Driver]):
         index: MemgraphIndexConfig | None = None,
         ttl: TTLConfig | None = None,
     ) -> Iterator[MemgraphStore]:
-        """Create a store from a Memgraph connection URI."""
+        """Create a store from a Memgraph connection URI.
+
+        This class method provides a convenient way to instantiate a MemgraphStore
+        from a connection string. It handles parsing the URI and creating the
+        database driver.
+
+        Args:
+            conn_string: The connection URI for the Memgraph database,
+                e.g., "memgraph://user:password@host:port".
+            database: The name of the database to connect to. Defaults to "memgraph".
+            index: Optional configuration for the Memgraph index.
+            ttl: Optional configuration for Time-To-Live (TTL) functionality.
+
+        Yields:
+            A MemgraphStore instance configured with the provided connection
+            details.
+        """
         parsed = urlparse(conn_string)
         uri = f"{parsed.scheme}://{parsed.hostname}:{parsed.port or 7687}"
         auth = (unquote(parsed.username or ""), unquote(parsed.password or ""))
@@ -573,7 +608,14 @@ class MemgraphStore(BaseStore, BaseMemgraphStore[Driver]):
             yield cls(driver, database=database, index=index, ttl=ttl)
 
     def sweep_ttl(self) -> int:
-        """Delete expired nodes and return count."""
+        """Delete expired nodes and return the count of deleted nodes.
+
+        This method executes a Cypher query to find and delete all nodes with the
+        label "StoreItem" that have an "expires_at" property in the past.
+
+        Returns:
+            The number of nodes that were deleted.
+        """
         with self._session() as session:
             result = session.run(
                 """
@@ -589,14 +631,28 @@ RETURN count(n) as deleted_count
     def start_ttl_sweeper(
         self, sweep_interval_minutes: int | None = None
     ) -> concurrent.futures.Future[None]:
-        """Start background TTL sweep identical to PostgresStore semantics."""
+        """Start a background thread for TTL sweeping.
+
+        This method starts a background process that periodically deletes expired
+        nodes from the store based on the TTL configuration. If a sweeper is
+        already running, this method will not start a new one.
+
+        Args:
+            sweep_interval_minutes: The interval in minutes at which to perform
+                the TTL sweep. If not provided, it falls back to the value in
+                the `ttl_config`, or 5 minutes by default.
+
+        Returns:
+            A `concurrent.futures.Future` that can be used to manage the
+            background task. The future can be used to cancel the sweeper.
+        """
         if not self.ttl_config:
             future: concurrent.futures.Future[None] = concurrent.futures.Future()
             future.set_result(None)
             return future
         if self._ttl_sweeper_thread and self._ttl_sweeper_thread.is_alive():
             logger.info("TTL sweeper already running")
-            fut = concurrent.futures.Future()
+            fut: concurrent.futures.Future[None] = concurrent.futures.Future()
             fut.add_done_callback(
                 lambda f: self._ttl_stop_event.set() if f.cancelled() else None
             )
@@ -632,7 +688,19 @@ RETURN count(n) as deleted_count
         return future
 
     def stop_ttl_sweeper(self, timeout: float | None = None) -> bool:
-        """Stop the TTL sweeper thread."""
+        """Stop the TTL sweeper thread and wait for it to terminate.
+
+        This method signals the background TTL sweeper thread to stop its execution.
+        It then waits for the thread to finish, with an optional timeout.
+
+        Args:
+            timeout: The maximum time in seconds to wait for the sweeper thread
+                to stop. If None, it will wait indefinitely.
+
+        Returns:
+            True if the TTL sweeper thread was stopped successfully within the
+            given timeout, False otherwise.
+        """
         if not self._ttl_sweeper_thread or not self._ttl_sweeper_thread.is_alive():
             return True
         logger.info("Stopping TTL sweeper thread")
@@ -661,6 +729,20 @@ RETURN count(n) as deleted_count
             yield tx
 
     def batch(self, ops: Iterable[Op]) -> list[Result]:
+        """Process a batch of operations in a single transaction.
+
+        This method groups operations by type (Put, Get, Search, ListNamespaces)
+        and executes them efficiently within a single Memgraph transaction. The
+        results are returned in the same order as the input operations.
+
+        Args:
+            ops: An iterable of operation objects (PutOp, GetOp, SearchOp,
+                ListNamespacesOp).
+
+        Returns:
+            A list of results corresponding to the input operations. The result
+            for a PutOp will be None.
+        """
         grouped, total = _group_ops(ops)
         results: list[Result] = [None] * total
         with self._session() as session, self._transaction(session) as tx:
@@ -688,7 +770,20 @@ RETURN count(n) as deleted_count
         return results
 
     async def abatch(self, ops: Iterable[Op]) -> list[Result]:
-        """Async equivalent of ``batch``."""
+        """Asynchronously process a batch of operations.
+
+        This method is the asynchronous equivalent of `batch`. It runs the
+        synchronous batch processing in a thread pool to avoid blocking the
+        event loop.
+
+        Args:
+            ops: An iterable of operation objects (PutOp, GetOp, SearchOp,
+                ListNamespacesOp).
+
+        Returns:
+            A list of results corresponding to the input operations. The result
+            for a PutOp will be None.
+        """
         return await asyncio.get_running_loop().run_in_executor(None, self.batch, ops)
 
     def _batch_get_ops(
@@ -697,12 +792,20 @@ RETURN count(n) as deleted_count
         results: list[Result],
         tx: Transaction,
     ) -> None:
-        for query, params, namespace, items in self._get_batch_GET_ops_queries(get_ops):
+        assert self._deserializer is not None
+        for query, params, namespace, items in self._get_batch_get_ops_queries(get_ops):
             for rec in tx.run(query, params):
                 idx = {i["key"]: i["idx"] for i in items}.get(rec["key"])
                 if idx is not None:
+                    record: Record = {
+                        "key": rec["key"],
+                        "value": rec["value"],
+                        "prefix": _namespace_to_text(namespace),
+                        "created_at": rec["created_at"],
+                        "updated_at": rec["updated_at"],
+                    }
                     results[idx] = _record_to_item(
-                        namespace, rec, loader=self._deserializer
+                        namespace, record, loader=self._deserializer
                     )
 
     def _batch_put_ops(
@@ -710,7 +813,7 @@ RETURN count(n) as deleted_count
         put_ops: Sequence[tuple[int, PutOp]],
         tx: Transaction,
     ) -> None:
-        queries, embedding_req = self._prepare_batch_PUT_queries(put_ops)
+        queries, embedding_req = self._prepare_batch_put_queries(put_ops)
         for q, p in queries:
             tx.run(q, p)
         if embedding_req:
@@ -743,18 +846,29 @@ RETURN count(n) as deleted_count
             for op_idx, text in embedding_reqs:
                 if text and op_idx in op_idx_to_params:
                     op_idx_to_params[op_idx]["embedding"] = t2e[text]
+        assert self._deserializer is not None
         for i, (op_idx, op) in enumerate(search_ops):
             query, params = queries[i]
             if op.query and not params.get("embedding"):
                 results[op_idx] = []
                 continue
             rows = tx.run(query, params)
-            results[op_idx] = [
-                _record_to_search_item(
-                    _decode_ns_text(r["prefix"]), r, loader=self._deserializer
+            items = []
+            for r in rows:
+                record: Record = {
+                    "key": r["key"],
+                    "value": r["value"],
+                    "prefix": r["prefix"],
+                    "created_at": r["created_at"],
+                    "updated_at": r["updated_at"],
+                    "score": r.get("score"),
+                }
+                items.append(
+                    _record_to_search_item(
+                        _decode_ns_text(r["prefix"]), record, loader=self._deserializer
+                    )
                 )
-                for r in rows
-            ]
+            results[op_idx] = items
 
     def _batch_list_namespaces_ops(
         self,
@@ -773,7 +887,29 @@ RETURN count(n) as deleted_count
             ]
 
     def setup(self) -> None:
-        """Apply schema and vector‑index migrations (idempotent)."""
+        """Initialize the database schema and vector indexes.
+
+        This method ensures that the Memgraph database is correctly set up for use
+        with the store. It performs the following actions:
+
+        1.  **Schema Migrations**: It applies a series of Cypher queries from
+            `self.MIGRATIONS` to create the necessary indexes and constraints.
+            It tracks the applied migration version to ensure that migrations
+            are only run once.
+
+        2.  **Vector Index Migrations**: If a vector index configuration is
+            provided (`self.index_config`), it also applies migrations from
+            `self.VECTOR_MIGRATIONS`. These create and configure the vector
+            search index. Some vector migrations are conditional and may be
+            skipped based on the store's configuration.
+
+        This entire setup process is idempotent and can be safely called multiple
+        times.
+
+        Raises:
+            Exception: If any migration fails for a reason other than the
+                underlying schema or index already existing.
+        """
 
         def _get_version(tx: Transaction, table: str) -> int:
             rec = tx.run(
@@ -844,6 +980,19 @@ SET m.version = $v
 
 
 class Record(TypedDict):
+    """Represents a single key-value record retrieved from the Memgraph store.
+
+    This class defines the structure of the data returned from database queries,
+    encapsulating the stored value along with its metadata.
+
+    Attributes:
+        key: The unique key for the record within its namespace.
+        value: The data associated with the key.
+        prefix: The namespace to which the record belongs.
+        created_at: The timestamp when the record was first created.
+        updated_at: The timestamp of the last update to the record.
+    """
+
     key: str
     value: Any
     prefix: str
@@ -893,7 +1042,7 @@ def _record_to_search_item(
         value=val,
         created_at=record["created_at"].to_native(),
         updated_at=record["updated_at"].to_native(),
-        score=float(score) if score is not None else None,
+        score=float(score) if isinstance(score, (float, int)) else None,
     )
 
 

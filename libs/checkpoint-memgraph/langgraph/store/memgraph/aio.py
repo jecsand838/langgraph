@@ -25,6 +25,7 @@ from langgraph.store.base.batch import AsyncBatchedBaseStore
 from langgraph.store.memgraph.base import (
     BaseMemgraphStore,
     MemgraphIndexConfig,
+    Record,
     TTLConfig,
     _decode_ns_text,
     _ensure_index_config,
@@ -39,6 +40,18 @@ logger = logging.getLogger(__name__)
 
 class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
     """Asynchronous Memgraph-backed store using the neo4j async driver.
+
+    This store interacts with a Memgraph database to persist, retrieve, and query
+    data. It is designed for use in asynchronous applications and supports batch
+    operations, vector-based semantic search, and Time-To-Live (TTL) data expiration.
+
+    Args:
+        conn: An asynchronous Memgraph database driver.
+        database: The name of the database to connect to.
+        deserializer: A function to deserialize stored data. Defaults to orjson.loads.
+        index: Configuration for creating vector indexes for semantic search.
+        ttl: Configuration for the Time-To-Live (TTL) feature for automatic data
+            expiration.
 
     !!! example "Examples"
         Basic setup and usage:
@@ -158,11 +171,9 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
 
     def _build_search_where_clause(self, op: SearchOp, params: dict[str, Any]) -> str:
         where_clauses = ["(n.expires_at IS NULL OR n.expires_at >= localdatetime())"]
-
         if op.namespace_prefix is not None:
             where_clauses.append("n.prefix STARTS WITH $prefix")
             params["prefix"] = _namespace_to_text(op.namespace_prefix)
-
         if op.filter:
             i = 0
             for key, value in op.filter.items():
@@ -193,7 +204,6 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
                     where_clauses.append(f"n.{key} = ${param_name}")
                     params[param_name] = value
                     i += 1
-
         return f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
 
     def _get_batch_list_namespaces_queries(
@@ -246,6 +256,19 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
         return queries
 
     async def abatch(self, ops: Iterable[Op]) -> list[Result]:
+        """Atomically executes a batch of operations against the store.
+
+        This method groups operations by type and executes them within a single
+        transaction, ensuring that all operations succeed or fail together.
+
+        Args:
+            ops: An iterable of operations (GetOp, PutOp, SearchOp, ListNamespacesOp)
+                to be executed.
+
+        Returns:
+            A list of results corresponding to the input operations. The result for a
+            PutOp will be None.
+        """
         grouped_ops, num_ops = _group_ops(ops)
         results: list[Result] = [None] * num_ops
         async with self._session() as session:
@@ -288,14 +311,24 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
             params,
             namespace,
             items,
-        ) in self._get_batch_GET_ops_queries(get_ops):
+        ) in self._get_batch_get_ops_queries(get_ops):
             result = await tx.run(query, params)
             key_to_idx = {item["key"]: item["idx"] for item in items}
-            async for record in result:
-                idx = key_to_idx.get(record["key"])
+            assert self._deserializer is not None
+            async for rec in result:
+                idx = key_to_idx.get(rec["key"])
                 if idx is not None:
+                    record: Record = {
+                        "key": rec["key"],
+                        "value": rec["value"],
+                        "prefix": _namespace_to_text(namespace),
+                        "created_at": rec["created_at"],
+                        "updated_at": rec["updated_at"],
+                    }
                     results[idx] = _record_to_item(
-                        namespace, record, loader=self._deserializer
+                        namespace,
+                        record,
+                        loader=self._deserializer,
                     )
 
     async def _batch_put_ops(
@@ -303,7 +336,7 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
         put_ops: Sequence[tuple[int, PutOp]],
         tx: AsyncTransaction,
     ) -> None:
-        queries, embedding_request = self._prepare_batch_PUT_queries(put_ops)
+        queries, embedding_request = self._prepare_batch_put_queries(put_ops)
         for query, params in queries:
             await tx.run(query, params)
         if embedding_request:
@@ -351,7 +384,6 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
                         op_idx_to_params[op_idx]["embedding"] = text_to_embedding.get(
                             text
                         )
-
         for i, (op_idx, _op) in enumerate(search_ops):
             if i >= len(queries):
                 continue
@@ -361,12 +393,19 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
                 continue
             result = await tx.run(query, params)
             search_items: list[SearchItem] = []
-            async for record in result:
+            assert self._deserializer is not None
+            async for r in result:
+                record: Record = {
+                    "key": r["key"],
+                    "value": r["value"],
+                    "prefix": r["prefix"],
+                    "created_at": r["created_at"],
+                    "updated_at": r["updated_at"],
+                    "score": r.get("score"),
+                }
                 search_items.append(
                     _record_to_search_item(
-                        _decode_ns_text(record["prefix"]),
-                        record,
-                        loader=self._deserializer,
+                        _decode_ns_text(r["prefix"]), record, loader=self._deserializer
                     )
                 )
             results[op_idx] = search_items
@@ -388,7 +427,16 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
             ]
 
     async def setup(self) -> None:
-        """Set up the store database asynchronously."""
+        """Set up the database schema and indexes.
+
+        This method applies all necessary migrations to the database to ensure that
+        the required constraints and indexes are in place for the store to
+        function correctly. It also handles the setup of vector indexes if a
+        vector search is configured.
+
+        This method is idempotent and should be called once before the store is
+        used.
+        """
 
         async def _get_version(tx: AsyncTransaction, table: str) -> int:
             result = await tx.run(
@@ -430,11 +478,9 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
                             f"Failed to apply migration {v}.\\nCypher={cypher}\\nError={e}"
                         )
                         raise
-
             if self.index_config:
                 async with self._transaction(session) as tx:
                     version = await _get_version(tx, "vector_migrations")
-
                 for v, migration in enumerate(
                     self.VECTOR_MIGRATIONS[version + 1 :], start=version + 1
                 ):
@@ -462,18 +508,16 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
                             )
                             raise
 
-    async def _clean(self) -> None:
-        """For tests only. Cleans the entire database."""
-        async with self._session() as session:
-            await session.run("MATCH (n) DETACH DELETE n")
-            try:
-                # Best effort to drop the index if it exists
-                await session.run("DROP INDEX ON :Embedding(embedding)")
-            except Exception:
-                pass
-
     async def sweep_ttl(self) -> int:
-        """Delete expired store items based on TTL."""
+        """Deletes expired items from the store based on their TTL.
+
+        This method queries the database for items where the `expires_at` timestamp
+        is in the past, and deletes them. It processes items in batches to avoid
+        long-running transactions.
+
+        Returns:
+            The number of items that were deleted.
+        """
         async with self._session() as session:
             result = await session.run(
                 """
@@ -490,10 +534,22 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
     async def start_ttl_sweeper(
         self, sweep_interval_minutes: int | None = None
     ) -> asyncio.Task[None]:
-        """Periodically delete expired store items based on TTL.
+        """Starts a background task to periodically delete expired items.
+
+        This method initiates a sweeper that runs in a continuous loop, calling
+        `sweep_ttl` at a specified interval. If a sweeper task is already
+        running, this method will return the existing task.
+
+        The TTL feature must be configured for the sweeper to run.
+
+        Args:
+            sweep_interval_minutes: The interval in minutes at which to sweep for
+                expired items. If not provided, it defaults to the value in the
+                TTLConfig, or 5 minutes.
 
         Returns:
-            Task that can be awaited or cancelled.
+            An asyncio.Task representing the running sweeper, which can be
+            used to monitor or cancel it.
         """
         if not self.ttl_config:
             return asyncio.create_task(asyncio.sleep(0))
@@ -563,5 +619,4 @@ class AsyncMemgraphStore(AsyncBatchedBaseStore, BaseMemgraphStore[AsyncDriver]):
             logger.info("TTL sweeper task stopped")
         else:
             logger.warning("Timed out waiting for TTL sweeper task to stop")
-
         return success
