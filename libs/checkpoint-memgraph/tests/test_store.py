@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import socket
 import time
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -29,6 +30,32 @@ TTL_SECONDS = 2
 TTL_MINUTES = TTL_SECONDS / 60
 
 
+def is_memgraph_unavailable() -> bool:
+    """
+    Check if a Memgraph instance is unavailable.
+
+    Returns:
+        bool: True if a Memgraph instance is not available, False otherwise.
+    """
+    try:
+        # Try to create a connection to the default Memgraph port.
+        parsed_uri = urlparse(DEFAULT_MEMGRAPH_URI)
+        if parsed_uri.port is None:
+            return True
+        with socket.create_connection(
+            (parsed_uri.hostname, parsed_uri.port), timeout=1
+        ):
+            return False
+    except (socket.timeout, ConnectionRefusedError):
+        return True
+
+
+# Skip all tests in this module if Memgraph is not available.
+pytestmark = pytest.mark.skipif(
+    is_memgraph_unavailable(), reason="Memgraph instance not available"
+)
+
+
 @pytest.fixture(scope="session")
 def driver() -> Generator[Driver, Any, None]:
     parsed = urlparse(DEFAULT_MEMGRAPH_URI)
@@ -55,7 +82,7 @@ def store(driver: Driver) -> Generator[MemgraphStore, Any, None]:
             session.run("DROP INDEX ON :Embedding(embedding)").consume()
         except Exception:
             pass  # Fails if the index does not exist, which is fine
-    time.sleep(5)
+    time.sleep(1)
     # Instantiate the store with the shared driver
     store = MemgraphStore(driver, ttl=ttl_config)
     store.setup()
@@ -370,13 +397,13 @@ def _create_vector_store_with_text_fields(
     }
     with driver.session() as session:
         session.run("MATCH (n) DETACH DELETE n").consume()
-        time.sleep(1)  # Allow time for the database to reset
+        time.sleep(0.5)  # Allow time for the database to reset
         try:
             session.run("DROP VECTOR INDEX vector_index").consume()
-            time.sleep(1)  # Allow time for the database to reset
+            time.sleep(0.5)  # Allow time for the database to reset
         except Exception:
             pass
-    time.sleep(5)  # Allow time for the database to reset
+    time.sleep(1)  # Allow time for the database to reset
     store = MemgraphStore(driver, index=index_config)
     store.setup()
     yield store

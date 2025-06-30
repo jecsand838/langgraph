@@ -1,7 +1,6 @@
-from __future__ import annotations
-
 import asyncio
 import itertools
+import socket
 import sys
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Coroutine, Iterator
@@ -32,6 +31,32 @@ from tests.conftest import (
 
 TTL_SECONDS = 6
 TTL_MINUTES = TTL_SECONDS / 60
+
+
+def is_memgraph_unavailable() -> bool:
+    """
+    Check if a Memgraph instance is unavailable.
+
+    Returns:
+        bool: True if a Memgraph instance is not available, False otherwise.
+    """
+    try:
+        # Try to create a connection to the default Memgraph port.
+        parsed_uri = urlparse(DEFAULT_MEMGRAPH_URI)
+        if parsed_uri.port is None:
+            return True
+        with socket.create_connection(
+            (parsed_uri.hostname, parsed_uri.port), timeout=1
+        ):
+            return False
+    except (socket.timeout, ConnectionRefusedError):
+        return True
+
+
+# Skip all tests in this module if Memgraph is not available.
+pytestmark = pytest.mark.skipif(
+    is_memgraph_unavailable(), reason="Memgraph instance not available"
+)
 
 
 @pytest.fixture(scope="session")
@@ -78,7 +103,7 @@ async def store(async_driver: AsyncDriver) -> AsyncIterator[AsyncMemgraphStore]:
             time.sleep(0.5)
         except Exception:
             pass
-    time.sleep(10)
+    time.sleep(2)
     await store.setup()
     await store.start_ttl_sweeper()
     yield store

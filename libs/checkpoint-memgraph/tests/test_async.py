@@ -1,3 +1,4 @@
+import socket
 from collections.abc import AsyncGenerator
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -16,6 +17,32 @@ from langgraph.checkpoint.base import (
 from langgraph.checkpoint.memgraph.aio import AsyncMemgraphSaver
 from langgraph.checkpoint.serde.types import TASKS
 from tests.conftest import DEFAULT_MEMGRAPH_URI
+
+
+def is_memgraph_unavailable() -> bool:
+    """
+    Check if a Memgraph instance is unavailable.
+
+    Returns:
+        bool: True if a Memgraph instance is not available, False otherwise.
+    """
+    try:
+        # Try to create a connection to the default Memgraph port.
+        parsed_uri = urlparse(DEFAULT_MEMGRAPH_URI)
+        if parsed_uri.port is None:
+            return True
+        with socket.create_connection(
+            (parsed_uri.hostname, parsed_uri.port), timeout=1
+        ):
+            return False
+    except (socket.timeout, ConnectionRefusedError):
+        return True
+
+
+# Skip all tests in this module if Memgraph is not available.
+pytestmark = pytest.mark.skipif(
+    is_memgraph_unavailable(), reason="Memgraph instance not available"
+)
 
 
 def _exclude_keys(config: dict[str, Any]) -> dict[str, Any]:
